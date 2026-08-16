@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "release": "v1.13.5",
+  "architecture": "linux-x86_64",
+  "distribution": "sherpa-onnx-v1.13.5-linux-x64-shared-no-tts",
+  "source_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.5/sherpa-onnx-v1.13.5-linux-x64-shared-no-tts.tar.bz2",
+  "sha256": "a39369615d610cb835f225b6b7fbff684aedf46557eab8a90e1ccc11fac84166",
+  "header": "include/sherpa-onnx/c-api/c-api.h",
+  "libraries": [
+    "lib/libsherpa-onnx-c-api.so",
+    "lib/libsherpa-onnx-cxx-api.so",
+    "lib/libonnxruntime.so"
+  ],
+  "minimum_glibc": "2.43",
+  "notes": "CPU distribution. GPU support requires a separately selected CUDA-compatible Sherpa bundle and matching host CUDA/cuDNN libraries."
+}

@@ -1,0 +1,4 @@
+.zig-cache
+zig-out
+
+*.m4a
