@@ -1,0 +1,22 @@
+[
+  {
+    "name": "disroot",
+    "url": "ssh://git@git.disroot.org/xiaoshihou/lszl.git"
+  },
+  {
+    "name": "sourcehut",
+    "url": "git@git.sr.ht:~xiaoshihou/lszl"
+  },
+  {
+    "name": "gitlab",
+    "url": "git@gitlab.com:xiaoshihou/lszl.git"
+  },
+  {
+    "name": "gitgud",
+    "url": "git@gitgud.io:xiaoshihou514/lszl.git"
+  },
+  {
+    "name": "frama",
+    "url": "git@framagit.org:xiaoshihou/lszl.git"
+  }
+]
