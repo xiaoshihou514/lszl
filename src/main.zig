@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @import("c.zig");
+const build_options = @import("build_options");
 
 const Catalog = struct {
     /// The upstream release tag holding all supported ASR archives.
@@ -293,7 +294,12 @@ fn modelNameIsValid(name: []const u8) bool {
 
 /// Returns the directory for data owned by lszl itself, such as installed
 /// models and the selected default. User-provided audio is never copied here.
+///
+/// The portable distribution sets LSZL_DATA_HOME to the bundle's `data/`
+/// directory (used as-is, not a base), so the whole bundle — runtime, models,
+/// transcripts — stays self-contained and no system packages are required.
 fn dataDirectory(allocator: std.mem.Allocator) ![]u8 {
+    if (std.c.getenv("LSZL_DATA_HOME")) |value| return allocator.dupe(u8, std.mem.span(value));
     const base = if (std.c.getenv("XDG_DATA_HOME")) |value|
         std.mem.span(value)
     else if (std.c.getenv("HOME")) |value|
@@ -411,6 +417,9 @@ test "catalog excludes non archives and files over one gibibyte" {
 }
 
 test "native API headers are available" {
+    // Portable builds deliberately skip the system FFmpeg/sherpa-onnx
+    // linkage, so the native headers are not present at compile time.
+    if (build_options.portable) return error.SkipZigTest;
     _ = c.ffmpeg.AV_NOPTS_VALUE;
     _ = c.sherpa.SherpaOnnxGetVersionStr;
 }

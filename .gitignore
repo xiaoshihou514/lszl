@@ -2,3 +2,10 @@
 zig-out
 
 *.m4a
+
+# portable packaging scratch space and output
+.portable-cache/
+.portable-staging/
+.user-test/
+.final-check/
+dist/

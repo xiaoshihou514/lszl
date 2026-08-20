@@ -4,9 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Portable mode produces a self-contained binary with no linkage against
+    // system FFmpeg or sherpa-onnx libraries. The CLI delegates all media
+    // decoding and inference to bundled tools, so the native linkage is only
+    // needed for the in-process sherpa integration planned by the technical
+    // plan. `zig build -Dportable -Dtarget=x86_64-linux-musl` yields a fully
+    // static binary that runs on any Linux x86_64 distribution.
+    const portable = b.option(bool, "portable", "Build without system FFmpeg/sherpa-onnx library linkage") orelse false;
+
     if (target.result.os.tag != .linux) {
         @panic("lszl supports Linux only");
     }
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "portable", portable);
 
     const default_sherpa_prefix = b.pathJoin(&.{
         b.graph.environ_map.get("XDG_DATA_HOME") orelse b.pathJoin(&.{ b.graph.environ_map.get("HOME") orelse ".", ".local", "share" }),
@@ -25,9 +36,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{.{ .name = "build_options", .module = build_options.createModule() }},
         }),
     });
-    configureNativeDependencies(b, exe, sherpa_include, sherpa_lib);
+    if (!portable) configureNativeDependencies(b, exe, sherpa_include, sherpa_lib);
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
@@ -41,9 +53,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{.{ .name = "build_options", .module = build_options.createModule() }},
         }),
     });
-    configureNativeDependencies(b, tests, sherpa_include, sherpa_lib);
+    if (!portable) configureNativeDependencies(b, tests, sherpa_include, sherpa_lib);
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 

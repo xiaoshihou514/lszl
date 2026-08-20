@@ -29,6 +29,10 @@ install: bootstrap-runtime
     zig build -Doptimize=ReleaseSafe
     bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"; install -Dm755 zig-out/bin/lszl "$bin_dir/lszl"; echo "Installed: $bin_dir/lszl"
 
+# Produce the self-contained portable tarball in dist/ (any Linux x86_64, no system packages).
+portable:
+    ./scripts/portable-pack.sh
+
 # Download the CUDA 13 cuDNN archive atomically into the local build cache.
 bootstrap-cudnn:
     mkdir -p .zig-cache
