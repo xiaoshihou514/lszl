@@ -4,8 +4,9 @@
 
 Ship `lszl` as a self-contained, relocatable tarball that any Linux x86_64
 user can unpack and run **without installing any system packages** (no zig,
-no ffmpeg, no ffmpeg-devel, no jq, no sherpa-onnx). The build environment is
-not part of the reproducibility contract; the produced bundle is.
+no ffmpeg, no ffmpeg-devel, no jq, no sherpa-onnx, no cuDNN). The build
+environment is not part of the reproducibility contract; the produced bundle
+is.
 
 The entry point is `scripts/portable-pack.sh`. It produces
 `dist/lszl-<version>-linux-x86_64-portable.tar.gz` plus a `SHA256SUMS` file.
@@ -55,16 +56,40 @@ lszl-portable/
 │   ├── ffprobe           # same static build
 │   └── jq                # static jq 1.7.1
 └── data/
-    ├── runtime/sherpa-onnx-v1.13.5-linux-x64-shared-no-tts/   # pre-seeded
-    └── models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/  # pre-seeded
+    ├── default-model                     # pre-set to paraformer
+    ├── runtime/
+    │   ├── sherpa-onnx-v1.13.5-linux-x64-shared-no-tts/            # CPU, trimmed
+    │   └── sherpa-onnx-v1.13.5-cuda-13.x-cudnn-9.x-...-linux-x64-gpu/  # GPU, trimmed
+    ├── cudnn/                             # cuDNN 9 (CUDA 13), extracted
+    ├── models/
+    │   ├── sherpa-onnx-streaming-paraformer-bilingual-zh-en/       # + 3 more presets
+    │   └── sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/  # trimmed
+    └── transcripts/                       # created on demand
 ```
 
-The sherpa-onnx runtime and the punctuation model are pre-seeded so the first
-`transcribe` needs no download beyond the ASR model itself. ASR models are
-**not** bundled by default (paraformer alone is ~1 GB); users run
-`./lszl model install <name>` once, or the packer passes
-`--with-models paraformer,nemo` to embed them. With `--with-models`, the
-bundle is fully offline-capable after unpacking.
+### Trimming
+
+The upstream sherpa-onnx runtimes ship ~35 binaries each (microphone, ALSA,
+VAD, keyword spotter, diarization, websocket servers, …). lszl only invokes
+three, so the packer deletes everything else:
+
+- `sherpa-onnx` — streaming ASR (zipformer, paraformer, zipformer-ctc)
+- `sherpa-onnx-offline` — offline ASR (nemo)
+- `sherpa-onnx-offline-punctuation` — punctuation
+
+The whole `lib/` directory is kept (the trimmed binaries link against
+`libonnxruntime.so` and the sherpa C++ API). The punctuation model directory
+is trimmed to `model.int8.onnx`.
+
+### GPU support
+
+The full bundle pre-seeds the CUDA 13 sherpa-onnx runtime and cuDNN 9 into
+`data/runtime/` and `data/cudnn/` (the same layout the embedded script
+already probes: `data/cudnn/lib/libcudnn.so.9`). At runtime the script
+auto-selects `provider=cuda` when `nvidia-smi` works and the bundled cuDNN is
+present; otherwise it falls back to the bundled CPU runtime. Only the NVIDIA
+driver/CUDA-13 toolkit libraries must come from the host — the CUDA toolkit
+cannot be redistributed in a bundle.
 
 ## Pinned artifacts
 
@@ -76,43 +101,49 @@ bundle. Downloads are cached in `.portable-cache/` and verified with
 | Artifact | Pin | SHA-256 |
 | --- | --- | --- |
 | sherpa-onnx CPU runtime | `v1.13.5` release tag | `a3936961…fac84166` |
+| sherpa-onnx CUDA runtime | `v1.13.5` release tag | `dde7732e…2ca7a35` |
+| cuDNN 9 (CUDA 13) | NVIDIA redist `9.25.0.15_cuda13` | `bdf8c65f…fa927745` |
 | FFmpeg static build | BtbN release `autobuild-2026-08-15-13-02`, asset `ffmpeg-n7.1.5-16-g9a4bb2c579-linux64-gpl-7.1.tar.xz` | `198fafe8…b01643fa` |
 | jq | `jq-1.7.1` release asset `jq-linux-amd64` | `5942c9b0…d19c8ff5` |
 | punctuation model | `punctuation-models` release tag | `c0d5aa5f…328a6e1` |
-| ASR models (optional) | `asr-models` release tag, one archive per preset | pinned per model in the script |
+| ASR models (4 presets) | `asr-models` release tag | pinned per model in the script |
 
 Notes:
 
 - FFmpeg comes from BtbN/FFmpeg-Builds rather than johnvansickle.com because
   the latter blocks scripted access (HTTP 403); the BtbN release tag pins the
   exact git revision of the build.
-- The GPU sherpa-onnx runtime is intentionally not bundled: the script
-  auto-selects it only when a CUDA device and the managed cuDNN runtime are
-  present, and it would otherwise just bloat the archive.
+- ASR model archives are large (paraformer ~1 GB, zipformer-ctc ~0.6 GB), so
+  the full tarball is several GB. `--models` and `--no-gpu` produce smaller
+  variants.
 
 ## Reproducing
 
 ```shell
 # Requires: a zig 0.16.x toolchain and curl/tar on the packer's machine.
-scripts/portable-pack.sh                      # default bundle (no ASR models)
-scripts/portable-pack.sh --with-models paraformer,nemo   # fully offline bundle
+scripts/portable-pack.sh                                     # full bundle
+scripts/portable-pack.sh --models zipformer,paraformer       # selected models
+scripts/portable-pack.sh --no-models --no-gpu                # minimal CPU bundle
 ```
 
 The script:
 
 1. builds the portable static binary into a staging prefix,
 2. fetches and SHA-256-verifies every pinned artifact into `.portable-cache/`,
-3. assembles `lszl-portable/` under `.portable-staging/`,
-4. smoke-tests `./lszl help` and `./lszl model list` from the bundle,
-5. writes `dist/lszl-<version>-linux-x86_64-portable.tar.gz` and `SHA256SUMS`.
+3. assembles `lszl-portable/` under `.portable-staging/`, trimming each
+   sherpa-onnx runtime to the three binaries lszl uses,
+4. pre-sets `data/default-model` to `paraformer`,
+5. smoke-tests `./lszl help` and `./lszl model list` from the bundle,
+6. writes `dist/lszl-<version>-linux-x86_64-portable.tar.gz` and `SHA256SUMS`.
 
 ## End-user flow
 
 ```shell
 tar -xzf lszl-0.1.0-linux-x86_64-portable.tar.gz
 cd lszl-portable
-./lszl model install paraformer   # one-time model download into ./data
-./lszl transcribe "录音.m4a"
+./lszl transcribe "录音.m4a"          # default model paraformer, fully offline
+./lszl transcribe --model nemo "speech.wav"
+./lszl doctor
 ```
 
 Host dependencies that remain: `bash`, `curl`, `tar`, `sha256sum` and the

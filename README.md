@@ -5,24 +5,30 @@
 ## 便携版（无需安装任何系统包）
 
 Linux x86_64 用户直接下载 `dist/lszl-0.1.0-linux-x86_64-portable.tar.gz`，
-解压即用，不依赖 zig / ffmpeg / ffmpeg-devel / jq 等任何系统包：
+解压即用，不依赖 zig / ffmpeg / ffmpeg-devel / jq / sherpa-onnx / cuDNN 等
+任何系统包。包内已自带全部 4 个 ASR 模型，**完全离线可用**：
 
 ```shell
 tar -xzf lszl-0.1.0-linux-x86_64-portable.tar.gz
 cd lszl-portable
+./lszl transcribe "录音.m4a"          # 默认 paraformer，开箱即用
+./lszl transcribe --model nemo "speech.wav"
 ./lszl model list
-./lszl model install paraformer   # 只需下载一次模型（~1 GB）
-./lszl model default paraformer
 ./lszl doctor
-./lszl transcribe "录音.m4a"
-
-# 临时指定模型
-./lszl transcribe --model zipformer-ctc "视频.mp4"
 ```
 
-包内自带静态链接的 `lszl`、FFmpeg、jq 以及 sherpa-onnx 运行时和标点模型；
-模型与转写结果都存放在包内 `./data` 目录，整个文件夹可随意移动、拷贝。
-打包与复现方式见 `scripts/portable-pack.sh` 和 `doc/agents/portable-pack.md`。
+包内自带：静态链接的 `lszl`、静态 FFmpeg 7.1.5、静态 jq、裁剪后的
+sherpa-onnx CPU/GPU 运行时、cuDNN 9、标点模型，以及全部模型；模型与转写
+结果都存放在包内 `./data` 目录，整个文件夹可随意移动、拷贝。有 NVIDIA
+驱动 + CUDA 13 库的机器会自动走 GPU（provider=cuda）。打包与复现方式见
+`scripts/portable-pack.sh` 和 `doc/agents/portable-pack.md`。
+
+需要更小体积的包时：
+
+```shell
+scripts/portable-pack.sh --models zipformer,paraformer   # 只带部分模型
+scripts/portable-pack.sh --no-models --no-gpu            # 最小 CPU 包
+```
 
 ## 从源码构建（面向开发者）
 

@@ -8,4 +8,5 @@ zig-out
 .portable-staging/
 .user-test/
 .final-check/
+.verify/
 dist/

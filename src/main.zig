@@ -325,7 +325,10 @@ fn loadDefaultModel(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(directory);
     const path = try std.fmt.allocPrint(allocator, "{s}/default-model", .{directory});
     defer allocator.free(path);
-    return std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(4096));
+    const content = try std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(4096));
+    defer allocator.free(content);
+    // Tolerate files written by hand or with echo/printf (trailing newline).
+    return allocator.dupe(u8, std.mem.trim(u8, content, " \t\r\n"));
 }
 
 pub fn main(init: std.process.Init) !void {
