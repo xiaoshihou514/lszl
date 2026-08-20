@@ -138,6 +138,8 @@ The script:
 
 ## End-user flow
 
+### Portable mode (no fixed location)
+
 ```shell
 tar -xzf lszl-0.1.0-linux-x86_64-portable.tar.gz
 cd lszl-portable
@@ -145,6 +147,31 @@ cd lszl-portable
 ./lszl transcribe --model nemo "speech.wav"
 ./lszl doctor
 ```
+
+The launcher resolves its own real path (`readlink -f`, so symlinks into
+`~/.local/bin` work) and points `LSZL_DATA_HOME` at the bundle's `data/`.
+
+### Standard install (~/.local/bin + ~/.local/share)
+
+The bundle ships `install.sh`, which produces the conventional per-user
+layout with a thin launcher in `bin` and the program plus all data under
+`share`:
+
+```shell
+tar -xzf lszl-0.1.0-linux-x86_64-portable.tar.gz
+cd lszl-portable
+./install.sh
+# -> $HOME/.local/bin/lszl          thin launcher, on PATH by default
+# -> $HOME/.local/share/lszl/       full bundle (binary, runtimes, models, data)
+lszl transcribe "录音.m4a"
+```
+
+Notes:
+
+- `PREFIX=/path ./install.sh` relocates both directories under `PREFIX`.
+- Uninstall: `$HOME/.local/share/lszl/install.sh --uninstall`.
+- `install.sh` is idempotent: re-running refreshes the installed copy.
+- Transcripts land in `$HOME/.local/share/lszl/data/transcripts/`.
 
 Host dependencies that remain: `bash`, `curl`, `tar`, `sha256sum` and the
 glibc needed by the bundled sherpa-onnx runtime — all present on any

@@ -5,16 +5,33 @@
 ## 便携版（无需安装任何系统包）
 
 Linux x86_64 用户直接下载 `dist/lszl-0.1.0-linux-x86_64-portable.tar.gz`，
-解压即用，不依赖 zig / ffmpeg / ffmpeg-devel / jq / sherpa-onnx / cuDNN 等
-任何系统包。包内已自带全部 4 个 ASR 模型，**完全离线可用**：
+不依赖 zig / ffmpeg / ffmpeg-devel / jq / sherpa-onnx / cuDNN 等任何系统包。
+包内已自带全部 4 个 ASR 模型，**完全离线可用**。
+
+### 安装到 ~/.local（推荐）
 
 ```shell
 tar -xzf lszl-0.1.0-linux-x86_64-portable.tar.gz
 cd lszl-portable
-./lszl transcribe "录音.m4a"          # 默认 paraformer，开箱即用
-./lszl transcribe --model nemo "speech.wav"
-./lszl model list
-./lszl doctor
+./install.sh            # 装到 ~/.local/bin/lszl + ~/.local/share/lszl/
+```
+
+之后直接 `lszl transcribe "录音.m4a"` 即可（默认模型 paraformer，开箱即用）。
+`~/.local/bin` 若不在 PATH，把它加进 `~/.bashrc`：
+
+```shell
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+卸载：`~/.local/share/lszl/install.sh --uninstall`。
+自定义前缀：`PREFIX=$HOME/.local ./install.sh`（也支持 `DESTDIR` 风格部署）。
+
+### 绿色运行（不解压到固定位置）
+
+```shell
+tar -xzf lszl-0.1.0-linux-x86_64-portable.tar.gz
+cd lszl-portable
+./lszl transcribe "录音.m4a"        # 或 ln -s 到 PATH 里任意目录
 ```
 
 包内自带：静态链接的 `lszl`、静态 FFmpeg 7.1.5、静态 jq、裁剪后的
