@@ -8,8 +8,20 @@ no ffmpeg, no ffmpeg-devel, no jq, no sherpa-onnx, no cuDNN). The build
 environment is not part of the reproducibility contract; the produced bundle
 is.
 
-The entry point is `scripts/portable-pack.sh`. It produces
-`dist/lszl-<version>-linux-x86_64-portable.tar.gz` plus a `SHA256SUMS` file.
+The entry point is `scripts/portable-pack.sh`. It produces the app bundle, one
+tarball per ASR model, plus a `SHA256SUMS` file:
+
+- `lszl-<version>-linux-x86_64-portable.tar.gz` — the app bundle (binary,
+  runtimes, ffmpeg, jq, punctuation model; **no ASR models**)
+- `lszl-<version>-linux-x86_64-models-<name>.tar.gz` — one tarball per ASR
+  model preset (`paraformer`, `zipformer`, `zipformer-ctc`, `nemo`,
+  `japanese`, `korean`, `vietnamese`, `multilingual`)
+
+Each model pack uses the same `lszl-portable/` top-level directory as the app
+bundle, so unpacking it next to the app bundle merges that model's
+`data/models/` into the bundle. Pass `--models <list>` to embed those models in
+the app bundle as well (the model packs then carry the same list), or
+`--no-models-pack` to skip the model packs.
 
 ## Why the native build is not portable
 
@@ -62,8 +74,8 @@ lszl-portable/
     │   └── sherpa-onnx-v1.13.5-cuda-13.x-cudnn-9.x-...-linux-x64-gpu/  # GPU, trimmed
     ├── cudnn/                             # cuDNN 9 (CUDA 13), extracted
     ├── models/
-    │   ├── sherpa-onnx-streaming-paraformer-bilingual-zh-en/       # + 3 more presets
-    │   └── sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/  # trimmed
+    │   ├── sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/  # trimmed, in app bundle
+    │   └── … ASR models live in the separate per-model packs (merged on unpack)
     └── transcripts/                       # created on demand
 ```
 
@@ -106,7 +118,7 @@ bundle. Downloads are cached in `.portable-cache/` and verified with
 | FFmpeg static build | BtbN release `autobuild-2026-08-15-13-02`, asset `ffmpeg-n7.1.5-16-g9a4bb2c579-linux64-gpl-7.1.tar.xz` | `198fafe8…b01643fa` |
 | jq | `jq-1.7.1` release asset `jq-linux-amd64` | `5942c9b0…d19c8ff5` |
 | punctuation model | `punctuation-models` release tag | `c0d5aa5f…328a6e1` |
-| ASR models (4 presets) | `asr-models` release tag | pinned per model in the script |
+| ASR models (8 presets) | `asr-models` release tag | pinned per model in the script |
 
 Notes:
 
@@ -114,16 +126,17 @@ Notes:
   the latter blocks scripted access (HTTP 403); the BtbN release tag pins the
   exact git revision of the build.
 - ASR model archives are large (paraformer ~1 GB, zipformer-ctc ~0.6 GB), so
-  the full tarball is several GB. `--models` and `--no-gpu` produce smaller
-  variants.
+  they ship as one tarball per model by default. `--models` embeds them in
+  the app bundle; `--no-gpu` and `--no-models-pack` shrink the app bundle.
 
 ## Reproducing
 
 ```shell
 # Requires: a zig 0.16.x toolchain and curl/tar on the packer's machine.
-scripts/portable-pack.sh                                     # full bundle
-scripts/portable-pack.sh --models zipformer,paraformer       # selected models
-scripts/portable-pack.sh --no-models --no-gpu                # minimal CPU bundle
+scripts/portable-pack.sh                                     # app bundle + 4 model packs
+scripts/portable-pack.sh --models zipformer,paraformer       # embed + pack the list
+scripts/portable-pack.sh --no-models --no-gpu                # minimal CPU app bundle
+scripts/portable-pack.sh --no-models-pack                    # app bundle only
 ```
 
 The script:
@@ -134,14 +147,22 @@ The script:
    sherpa-onnx runtime to the three binaries lszl uses,
 4. pre-sets `data/default-model` to `paraformer`,
 5. smoke-tests `./lszl help` and `./lszl model list` from the bundle,
-6. writes `dist/lszl-<version>-linux-x86_64-portable.tar.gz` and `SHA256SUMS`.
+6. writes `dist/lszl-<version>-linux-x86_64-portable.tar.gz`, one
+   `dist/lszl-<version>-linux-x86_64-models-<name>.tar.gz` per model
+   (unless `--no-models-pack`), and `SHA256SUMS`.
+
+Note: ASR model archives are large (paraformer ~1 GB, zipformer-ctc ~0.6 GB),
+so they are kept out of the app bundle by default and shipped as one tarball
+per model; the end user only downloads the models they actually use, instead
+of a several-GB all-in-one archive or `lszl model install` over the network.
 
 ## End-user flow
 
 ### Portable mode (no fixed location)
 
 ```shell
-tar -xzf lszl-0.1.0-linux-x86_64-portable.tar.gz
+tar -xzf lszl-0.1.1-linux-x86_64-portable.tar.gz
+tar -xzf lszl-0.1.1-linux-x86_64-models-paraformer.tar.gz   # same directory: merges data/models/
 cd lszl-portable
 ./lszl transcribe "录音.m4a"          # default model paraformer, fully offline
 ./lszl transcribe --model nemo "speech.wav"
@@ -158,7 +179,8 @@ layout with a thin launcher in `bin` and the program plus all data under
 `share`:
 
 ```shell
-tar -xzf lszl-0.1.0-linux-x86_64-portable.tar.gz
+tar -xzf lszl-0.1.1-linux-x86_64-portable.tar.gz
+tar -xzf lszl-0.1.1-linux-x86_64-models-paraformer.tar.gz   # same directory
 cd lszl-portable
 ./install.sh
 # -> $HOME/.local/bin/lszl          thin launcher, on PATH by default

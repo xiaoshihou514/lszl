@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("c.zig");
 const build_options = @import("build_options");
+const preset = @import("preset.zig");
 
 const Catalog = struct {
     /// The upstream release tag holding all supported ASR archives.
@@ -8,18 +9,8 @@ const Catalog = struct {
     pub const release_api = "https://api.github.com/repos/k2-fsa/sherpa-onnx/releases/tags/asr-models";
     pub const max_archive_bytes: u64 = 1024 * 1024 * 1024;
 
-    const Preset = struct {
-        name: []const u8,
-        upstream_name: []const u8,
-        description: []const u8,
-    };
-
-    pub const presets = [_]Preset{
-        .{ .name = "zipformer", .upstream_name = "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20", .description = "streaming Chinese/English transducer" },
-        .{ .name = "paraformer", .upstream_name = "sherpa-onnx-streaming-paraformer-bilingual-zh-en", .description = "streaming Chinese/English Paraformer" },
-        .{ .name = "zipformer-ctc", .upstream_name = "sherpa-onnx-streaming-zipformer-ctc-zh-xlarge-int8-2025-06-30", .description = "streaming Chinese Zipformer CTC (large)" },
-        .{ .name = "nemo", .upstream_name = "sherpa-onnx-nemo-ctc-en-conformer-small", .description = "offline English NeMo CTC" },
-    };
+    pub const presets = preset.presets;
+    pub const Preset = preset.Preset;
 
     fn isSupportedArchive(name: []const u8, size: u64) bool {
         return size <= max_archive_bytes and std.mem.endsWith(u8, name, ".tar.bz2") and
@@ -107,9 +98,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
 }
 
 fn presetName(name: []const u8) ?[]const u8 {
-    for (Catalog.presets) |preset| {
-        if (std.mem.eql(u8, name, preset.name) or std.mem.eql(u8, name, preset.upstream_name)) return preset.name;
-    }
+    if (preset.find(name)) |found| return found.name;
     return null;
 }
 
@@ -143,6 +132,10 @@ const runtime_script =
     \\    paraformer) echo "sherpa-onnx-streaming-paraformer-bilingual-zh-en" ;;
     \\    zipformer-ctc) echo "sherpa-onnx-streaming-zipformer-ctc-zh-xlarge-int8-2025-06-30" ;;
     \\    nemo) echo "sherpa-onnx-nemo-ctc-en-conformer-small" ;;
+    \\    japanese) echo "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17" ;;
+    \\    korean) echo "sherpa-onnx-streaming-zipformer-korean-2024-06-16" ;;
+    \\    vietnamese) echo "sherpa-onnx-zipformer-vi-2025-04-20" ;;
+    \\    multilingual) echo "sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10" ;;
     \\    *) return 1 ;;
     \\  esac
     \\}
@@ -181,8 +174,12 @@ const runtime_script =
     \\      sherpa-onnx-streaming-paraformer-bilingual-zh-en) default=paraformer ;;
     \\      sherpa-onnx-streaming-zipformer-ctc-zh-xlarge-int8-2025-06-30) default=zipformer-ctc ;;
     \\      sherpa-onnx-nemo-ctc-en-conformer-small) default=nemo ;;
+    \\      sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17) default=japanese ;;
+    \\      sherpa-onnx-streaming-zipformer-korean-2024-06-16) default=korean ;;
+    \\      sherpa-onnx-zipformer-vi-2025-04-20) default=vietnamese ;;
+    \\      sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10) default=multilingual ;;
     \\    esac
-    \\    for model in zipformer paraformer zipformer-ctc nemo; do
+    \\    for model in zipformer paraformer zipformer-ctc nemo japanese korean vietnamese multilingual; do
     \\      upstream="$(upstream_name "$model")"; status="installable"; marker=""
     \\      if [ -f "$data/models/$upstream/tokens.txt" ]; then status="installed"; fi
     \\      if [ "$model" = "$default" ]; then marker="default"; fi
@@ -210,7 +207,7 @@ const runtime_script =
     \\  transcribe)
     \\    model="$1"; input="$2"; upstream="$(upstream_name "$model")"
     \\    install_runtime; install_punctuation
-    \\    test -f "$data/models/$upstream/tokens.txt" || { echo "Model is not installed: $model. Run: lszl model install $model" >&2; exit 2; }
+    \\    test -f "$data/models/$upstream/tokens.txt" || { echo "Model is not installed: $model. Run: lszl model install $model" >&2; echo "  Portable bundles: unpack the matching lszl-*-models-$model.tar.gz next to lszl-portable/ (or run: lszl model install $model)" >&2; exit 2; }
     \\    command -v ffmpeg >/dev/null || { echo "ffmpeg is required" >&2; exit 2; }
     \\    command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
     \\    work="$data/cache/run-$$"; mkdir -p "$work"
@@ -218,24 +215,54 @@ const runtime_script =
     \\    trap cleanup EXIT
     \\    model_dir="$data/models/$upstream"; raw="$work/raw.txt"; diagnostics="$work/backend.log"
     \\    : >"$raw"; : >"$diagnostics"
-    \\    if [ "$model" = nemo ]; then
-    \\      ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le -f segment -segment_time 60 "$work/chunk-%04d.wav" >/dev/null 2>&1
-    \\      for wav in "$work"/chunk-*.wav; do
-    \\        result="$work/result.json"
-    \\        LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx-offline" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --nemo-ctc-model="$model_dir/model.int8.onnx" "$wav" >"$result" 2>>"$diagnostics"
-    \\        jq -r '.text' "$result" >>"$raw"
-    \\      done
-    \\    else
-    \\      wav="$work/input.wav"; result="$work/result.txt"
-    \\      ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le "$wav" >/dev/null 2>&1
-    \\      case "$model" in
-    \\        zipformer) LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --encoder="$model_dir/encoder-epoch-99-avg-1.int8.onnx" --decoder="$model_dir/decoder-epoch-99-avg-1.int8.onnx" --joiner="$model_dir/joiner-epoch-99-avg-1.int8.onnx" "$wav" >"$result" 2>>"$diagnostics" ;;
-    \\        paraformer) LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --paraformer-encoder="$model_dir/encoder.int8.onnx" --paraformer-decoder="$model_dir/decoder.int8.onnx" "$wav" >"$result" 2>>"$diagnostics" ;;
-    \\        zipformer-ctc) LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --zipformer2-ctc-model="$model_dir/model.int8.onnx" "$wav" >"$result" 2>>"$diagnostics" ;;
-    \\      esac
-    \\      awk '/^\{ "text": / { print previous; exit } { previous=$0 }' "$diagnostics" >"$raw"
-    \\      test -s "$raw" || { echo "Recognizer returned no transcript text" >&2; exit 3; }
-    \\    fi
+    \\    # Pick the encoder/decoder/joiner onnx for a zipformer transducer,
+    \\    # preferring int8 and falling back to the fp32 file.
+    \\    pick_onnx() { # prefix dir
+    \\      f="$(find "$2" -maxdepth 1 -name "$1"*.int8.onnx | head -1)"
+    \\      if [ -z "$f" ]; then f="$(find "$2" -maxdepth 1 -name "$1"*.onnx | head -1)"; fi
+    \\      printf '%s' "$f"
+    \\    }
+    \\    case "$model" in
+    \\      nemo)
+    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le -f segment -segment_time 60 "$work/chunk-%04d.wav" >/dev/null 2>&1
+    \\        for wav in "$work"/chunk-*.wav; do
+    \\          result="$work/result.json"
+    \\          LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx-offline" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --nemo-ctc-model="$model_dir/model.int8.onnx" "$wav" >"$result" 2>>"$diagnostics"
+    \\          jq -r '.text' "$result" >>"$raw"
+    \\        done
+    \\        ;;
+    \\      japanese|vietnamese)
+    \\        enc="$(pick_onnx encoder "$model_dir")"; dec="$(pick_onnx decoder "$model_dir")"; joi="$(pick_onnx joiner "$model_dir")"
+    \\        test -n "$enc" -a -n "$dec" -a -n "$joi" || { echo "transducer model files missing in $model_dir" >&2; exit 3; }
+    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le -f segment -segment_time 60 "$work/chunk-%04d.wav" >/dev/null 2>&1
+    \\        for wav in "$work"/chunk-*.wav; do
+    \\          result="$work/result.json"
+    \\          LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx-offline" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --encoder="$enc" --decoder="$dec" --joiner="$joi" "$wav" >"$result" 2>>"$diagnostics"
+    \\          jq -r '.text' "$result" >>"$raw"
+    \\        done
+    \\        ;;
+    \\      zipformer|korean|multilingual)
+    \\        wav="$work/input.wav"; result="$work/result.txt"
+    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le "$wav" >/dev/null 2>&1
+    \\        enc="$(pick_onnx encoder "$model_dir")"; dec="$(pick_onnx decoder "$model_dir")"; joi="$(pick_onnx joiner "$model_dir")"
+    \\        test -n "$enc" -a -n "$dec" -a -n "$joi" || { echo "transducer model files missing in $model_dir" >&2; exit 3; }
+    \\        LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --encoder="$enc" --decoder="$dec" --joiner="$joi" "$wav" >"$result" 2>>"$diagnostics"
+    \\        awk '/^\{ "text": / { print previous; exit } { previous=$0 }' "$diagnostics" >"$raw"
+    \\        ;;
+    \\      paraformer)
+    \\        wav="$work/input.wav"; result="$work/result.txt"
+    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le "$wav" >/dev/null 2>&1
+    \\        LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --paraformer-encoder="$model_dir/encoder.int8.onnx" --paraformer-decoder="$model_dir/decoder.int8.onnx" "$wav" >"$result" 2>>"$diagnostics"
+    \\        awk '/^\{ "text": / { print previous; exit } { previous=$0 }' "$diagnostics" >"$raw"
+    \\        ;;
+    \\      zipformer-ctc)
+    \\        wav="$work/input.wav"; result="$work/result.txt"
+    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le "$wav" >/dev/null 2>&1
+    \\        LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --zipformer2-ctc-model="$model_dir/model.int8.onnx" "$wav" >"$result" 2>>"$diagnostics"
+    \\        awk '/^\{ "text": / { print previous; exit } { previous=$0 }' "$diagnostics" >"$raw"
+    \\        ;;
+    \\    esac
+    \\    test -s "$raw" || { echo "Recognizer returned no transcript text" >&2; exit 3; }
     \\    stem="$(basename "$input")"; output="$data/transcripts/$model/$stem.txt"; mkdir -p "$(dirname "$output")"
     \\    temporary="$output.tmp-$$"; : >"$temporary"
     \\    punctuation_model="$data/models/$punctuation_name/model.int8.onnx"

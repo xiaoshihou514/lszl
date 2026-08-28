@@ -7,35 +7,46 @@
 #   - the static lszl executable, static FFmpeg 7.1.5 and static jq 1.7.1
 #   - the sherpa-onnx CPU runtime, trimmed to the three binaries lszl uses
 #   - the punctuation model
-#   - all four ASR model presets by default (fully offline after unpacking)
 #   - GPU support: the CUDA sherpa-onnx runtime and cuDNN 9 (auto-selected
 #     when an NVIDIA driver with CUDA 13 libraries is present)
+#
+# The four ASR model presets are NOT embedded in the app bundle by default;
+# each is shipped as its own dist/lszl-<version>-linux-x86_64-models-<name>.tar.gz
+# (same lszl-portable/ top-level directory, so unpacking one next to the app
+# bundle merges that model into data/models/). Pass --models <list> to embed
+# those models in the app bundle as well; the models packs then carry the
+# same list. --no-models-pack disables the models packs entirely.
 #
 # Every external artifact is pinned by URL and SHA-256, so the produced
 # bundle is reproducible; the build environment itself is whatever machine
 # you run this on (a zig 0.16.x toolchain is the only requirement).
 #
 # Usage:
-#   scripts/portable-pack.sh                 # full bundle (models + GPU)
-#   scripts/portable-pack.sh --models zipformer,paraformer
-#   scripts/portable-pack.sh --no-models --no-gpu   # minimal CPU bundle
+#   scripts/portable-pack.sh                 # app bundle + 4 model packs
+#   scripts/portable-pack.sh --models zipformer,paraformer   # embed + pack list
+#   scripts/portable-pack.sh --no-models --no-gpu            # minimal CPU bundle
+#   scripts/portable-pack.sh --no-models-pack                # app bundle only
 set -euo pipefail
 
-version="0.1.0"
+version="0.1.1"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache="$repo_root/.portable-cache"
 staging="$repo_root/.portable-staging"
 dist_dir="$repo_root/dist"
 bundle_name="lszl-portable"
 bundle_dir="$staging/$bundle_name"
+models_pack_root="$staging/models-pack"
 archive="$dist_dir/lszl-${version}-linux-x86_64-portable.tar.gz"
+models_archive_prefix="lszl-${version}-linux-x86_64-models-"
 
 models_to_bundle=""
+bundle_models_pack="1"
 bundle_gpu="1"
 while [ $# -gt 0 ]; do
   case "$1" in
     --models) models_to_bundle="${2:-}"; shift 2 ;;
     --no-models) models_to_bundle="none"; shift ;;
+    --no-models-pack) bundle_models_pack="0"; shift ;;
     --no-gpu) bundle_gpu="0"; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -80,10 +91,18 @@ model_sha256_zipformer="27ffbd9ee24ad186d99acc2f6354d7992b27bcab490812510665fa8f
 model_sha256_paraformer="5462a1fce42693deae572af1e8c4687124b12aa85fe61ff4d3168bb5280e205f"
 model_sha256_zipformer_ctc="23f32059d502e87f4fe4b1a17dbedb65582bb0c42950b3d615f218bb25feafd5"
 model_sha256_nemo="83dcb462aece5bef4e8072c267419389f0b8d1f91152d8851765f284ff664caa"
+model_sha256_japanese="dc03758608c0280e2cbcaac4597467ffcf846ae0b06436f1706738a11da86f5d"
+model_sha256_korean="e346a5882a409650472be17326237e24df7bf409db6b4a8a52e1a61422bf2500"
+model_sha256_vietnamese="501b2f6e12d5871ff35dc356cf41bb3197f7e32fb7480db744d603bc99a9ad02"
+model_sha256_multilingual="28044b67324f7f831689f0a3761473dd2ade380e93aa53f1dbcd479ef71c40d4"
 model_upstream_zipformer="sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
 model_upstream_paraformer="sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 model_upstream_zipformer_ctc="sherpa-onnx-streaming-zipformer-ctc-zh-xlarge-int8-2025-06-30"
 model_upstream_nemo="sherpa-onnx-nemo-ctc-en-conformer-small"
+model_upstream_japanese="sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17"
+model_upstream_korean="sherpa-onnx-streaming-zipformer-korean-2024-06-16"
+model_upstream_vietnamese="sherpa-onnx-zipformer-vi-2025-04-20"
+model_upstream_multilingual="sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10"
 
 # --- Helpers -----------------------------------------------------------------
 fetch() { # url dest sha256
@@ -117,8 +136,12 @@ install_runtime() { # archive_dir top_name
 
 # --- Build the portable binary -----------------------------------------------
 echo "==> building portable lszl binary"
-mkdir -p "$cache/zig-global" "$cache/zig-local"
-ZIG_GLOBAL_CACHE_DIR="$cache/zig-global" ZIG_LOCAL_CACHE_DIR="$cache/zig-local" \
+# zig-local may be a symlink to a tmpfs on filesystems where zig's cache
+# rename fails (e.g. WSL2 drvfs/9p); mkdir -p tolerates it.
+mkdir -p "$cache/zig-global" "$cache/zig-local" 2>/dev/null || true
+zig_global_cache="${ZIG_GLOBAL_CACHE_DIR:-$cache/zig-global}"
+zig_local_cache="${ZIG_LOCAL_CACHE_DIR:-$cache/zig-local}"
+ZIG_GLOBAL_CACHE_DIR="$zig_global_cache" ZIG_LOCAL_CACHE_DIR="$zig_local_cache" \
   zig build -Dportable -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --prefix "$staging/zig-out"
 test -x "$staging/zig-out/bin/lszl"
 "$staging/zig-out/bin/lszl" help >/dev/null
@@ -163,24 +186,48 @@ fetch "$jq_url" "$cache/jq" "$jq_sha256"
 install -m755 "$cache/jq" "$bundle_dir/bin/jq"
 "$bundle_dir/bin/jq" --version >/dev/null
 
-# ASR models: default = all presets; --models <list> selects; --no-models skips.
+# Extract one ASR model archive into a data/models directory.
+# Usage: bundle_model <model> <dest_data_models_dir>
+bundle_model() { # model dest
+  case "$1" in
+    zipformer) upstream="$model_upstream_zipformer"; model_sha256="$model_sha256_zipformer" ;;
+    paraformer) upstream="$model_upstream_paraformer"; model_sha256="$model_sha256_paraformer" ;;
+    zipformer-ctc) upstream="$model_upstream_zipformer_ctc"; model_sha256="$model_sha256_zipformer_ctc" ;;
+    nemo) upstream="$model_upstream_nemo"; model_sha256="$model_sha256_nemo" ;;
+    japanese) upstream="$model_upstream_japanese"; model_sha256="$model_sha256_japanese" ;;
+    korean) upstream="$model_upstream_korean"; model_sha256="$model_sha256_korean" ;;
+    vietnamese) upstream="$model_upstream_vietnamese"; model_sha256="$model_sha256_vietnamese" ;;
+    multilingual) upstream="$model_upstream_multilingual"; model_sha256="$model_sha256_multilingual" ;;
+    *) echo "unknown model: $1" >&2; exit 2 ;;
+  esac
+  echo "==> bundling model: $1"
+  fetch "$model_url_base/${upstream}.tar.bz2" "$cache/${upstream}.tar.bz2" "$model_sha256"
+  tar -xjf "$cache/${upstream}.tar.bz2" -C "$2"
+  test -f "$2/$upstream/tokens.txt"
+}
+
+# ASR models. Default split layout:
+#   - the app bundle embeds NO ASR models (punctuation model stays in the app)
+#   - the standalone models pack carries all four presets
+# --models <list> embeds those models in the app bundle AND in the models pack;
+# --no-models skips models entirely; --no-models-pack disables the models pack.
+models_pack_list=""
 if [ -z "$models_to_bundle" ]; then
-  models_to_bundle="zipformer,paraformer,zipformer-ctc,nemo"
+  models_to_bundle="none"
+  models_pack_list="zipformer,paraformer,zipformer-ctc,nemo,japanese,korean,vietnamese,multilingual"
+elif [ "$models_to_bundle" = "none" ]; then
+  models_pack_list="none"
+else
+  models_pack_list="$models_to_bundle"
 fi
+if [ "$bundle_models_pack" = "0" ]; then
+  models_pack_list="none"
+fi
+
 if [ "$models_to_bundle" != "none" ]; then
   IFS=',' read -ra model_list <<< "$models_to_bundle"
   for model in "${model_list[@]}"; do
-    case "$model" in
-      zipformer) upstream="$model_upstream_zipformer"; model_sha256="$model_sha256_zipformer" ;;
-      paraformer) upstream="$model_upstream_paraformer"; model_sha256="$model_sha256_paraformer" ;;
-      zipformer-ctc) upstream="$model_upstream_zipformer_ctc"; model_sha256="$model_sha256_zipformer_ctc" ;;
-      nemo) upstream="$model_upstream_nemo"; model_sha256="$model_sha256_nemo" ;;
-      *) echo "unknown model: $model" >&2; exit 2 ;;
-    esac
-    echo "==> bundling model: $model"
-    fetch "$model_url_base/${upstream}.tar.bz2" "$cache/${upstream}.tar.bz2" "$model_sha256"
-    tar -xjf "$cache/${upstream}.tar.bz2" -C "$bundle_dir/data/models"
-    test -f "$bundle_dir/data/models/$upstream/tokens.txt"
+    bundle_model "$model" "$bundle_dir/data/models"
   done
 fi
 
@@ -249,13 +296,21 @@ chmod +x "$bundle_dir/install.sh"
 cat > "$bundle_dir/README.txt" <<EOF
 lszl $version (portable, Linux x86_64)
 ======================================
-Unpack anywhere and run; no system packages are needed. All four ASR models
-are already bundled, so transcription works fully offline:
+Unpack anywhere and run; no system packages are needed. ASR models are shipped
+as one tarball per model (dist/lszl-${version}-linux-x86_64-models-<name>.tar.gz)
+to keep downloads small. Unpack the model(s) you want next to this bundle so
+their lszl-portable/ directory merges into this one, then transcribe:
+
+  tar -xzf lszl-${version}-linux-x86_64-models-paraformer.tar.gz  # or zipformer / zipformer-ctc / nemo
 
   ./lszl model list
   ./lszl transcribe "录音.m4a"
   ./lszl transcribe --model nemo "speech.wav"
   ./lszl doctor
+
+Missing a model? Either unpack its tarball, or install on demand:
+
+  ./lszl model install paraformer
 
 GPU: if an NVIDIA driver with CUDA 13 libraries is installed, lszl
 automatically uses the bundled CUDA runtime and cuDNN 9 (provider=cuda).
@@ -274,9 +329,28 @@ echo "==> smoke test"
 # --- Archive -------------------------------------------------------------------
 mkdir -p "$dist_dir"
 rm -f "$archive"
+rm -f "$dist_dir"/lszl-${version}-linux-x86_64-models-*.tar.gz
+
+# Standalone model packs: one tarball per model, each with the same
+# lszl-portable/ top-level directory as the app bundle, so unpacking it next
+# to the app bundle merges that model into data/models/.
+if [ "$models_pack_list" != "none" ]; then
+  IFS=',' read -ra model_list <<< "$models_pack_list"
+  for model in "${model_list[@]}"; do
+    echo "==> assembling standalone model pack: $model"
+    rm -rf "$models_pack_root"
+    mkdir -p "$models_pack_root/$bundle_name/data/models"
+    bundle_model "$model" "$models_pack_root/$bundle_name/data/models"
+    tar -czf "$dist_dir/${models_archive_prefix}${model}.tar.gz" -C "$models_pack_root" "$bundle_name"
+  done
+fi
+
 tar -czf "$archive" -C "$staging" "$bundle_name"
-(cd "$dist_dir" && sha256sum "lszl-${version}-linux-x86_64-portable.tar.gz" > SHA256SUMS)
+(cd "$dist_dir" && sha256sum "lszl-${version}-linux-x86_64-portable.tar.gz" "lszl-${version}-linux-x86_64-models-"*.tar.gz > SHA256SUMS)
 echo "==> produced:"
 echo "  $archive"
+for pack in "$dist_dir"/lszl-${version}-linux-x86_64-models-*.tar.gz; do
+  [ -e "$pack" ] && echo "  $pack"
+done
 echo "  $dist_dir/SHA256SUMS"
-du -h "$archive"
+du -h "$archive" "$dist_dir"/lszl-${version}-linux-x86_64-models-*.tar.gz

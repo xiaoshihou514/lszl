@@ -29,7 +29,7 @@ install: bootstrap-runtime
     zig build -Doptimize=ReleaseSafe
     bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"; install -Dm755 zig-out/bin/lszl "$bin_dir/lszl"; echo "Installed: $bin_dir/lszl"
 
-# Produce the self-contained portable tarball in dist/ (any Linux x86_64, no system packages).
+# Produce the portable app bundle and standalone models pack in dist/ (any Linux x86_64, no system packages).
 portable:
     ./scripts/portable-pack.sh
 
