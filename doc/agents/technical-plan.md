@@ -1,5 +1,17 @@
 # lszl technical plan
 
+> **Status (v0.2.0):** the native pipeline described below is implemented.
+> `src/main.zig` is a plain CLI dispatcher; `src/ffmpeg.zig` (libav* streaming
+> decoder), `src/sherpa.zig` (C API binding), `src/transcribe.zig`
+> (pipeline + GPU-memory-aware feeding), `src/gpu.zig` (NVML probe + slice
+> planner), `src/fetch.zig` / `src/archive.zig` / `src/model_store.zig`
+> (native downloads, bz2+tar extraction, model store) replace the former
+> embedded shell script. Deliberate deviations from this plan:
+> the sherpa-onnx runtime is dlopen'd per machine (CPU/CUDA bundles share
+> sonames) instead of linked at build time; bzip2 is dlopen'd likewise
+> (Zig std has no bz2); model catalogs are pinned by SHA-256 in
+> `src/preset.zig` rather than resolved through the GitHub release API.
+
 ## Purpose and boundaries
 
 `lszl` is a Linux-only command-line program for offline audio transcription. It accepts an audio or video file, decodes its primary audio stream through the FFmpeg libraries installed on the host, resamples it into the format required by sherpa-onnx, and emits a transcript. The initial scope is local, non-streaming ASR; it does not record from a microphone, host a network service, or bundle models in the executable.

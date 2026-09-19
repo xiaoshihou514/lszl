@@ -1,22 +1,8 @@
 const std = @import("std");
-const c = @import("c.zig");
-const build_options = @import("build_options");
 const preset = @import("preset.zig");
-
-const Catalog = struct {
-    /// The upstream release tag holding all supported ASR archives.
-    pub const release_tag = "asr-models";
-    pub const release_api = "https://api.github.com/repos/k2-fsa/sherpa-onnx/releases/tags/asr-models";
-    pub const max_archive_bytes: u64 = 1024 * 1024 * 1024;
-
-    pub const presets = preset.presets;
-    pub const Preset = preset.Preset;
-
-    fn isSupportedArchive(name: []const u8, size: u64) bool {
-        return size <= max_archive_bytes and std.mem.endsWith(u8, name, ".tar.bz2") and
-            (std.mem.startsWith(u8, name, "sherpa-onnx-") or std.mem.startsWith(u8, name, "icefall-asr-"));
-    }
-};
+const gpu = @import("gpu.zig");
+const model_store = @import("model_store.zig");
+const transcribe = @import("transcribe.zig");
 
 const Command = union(enum) {
     help,
@@ -93,327 +79,334 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\
         \\Models use short names shown by `lszl model list`.
         \\Without --model, transcribe uses the configured default model.
+        \\LSZL_PROVIDER=cpu|cuda forces an execution provider (default: auto).
         \\
     );
 }
 
-fn presetName(name: []const u8) ?[]const u8 {
-    if (preset.find(name)) |found| return found.name;
-    return null;
-}
-
-const runtime_script =
-    \\set -eu
-    \\action="$1"; shift
-    \\data="$1"; shift
-    \\cpu_runtime="sherpa-onnx-v1.13.5-linux-x64-shared-no-tts"
-    \\gpu_runtime="sherpa-onnx-v1.13.5-cuda-13.x-cudnn-9.x-onnxruntime1.27.1-linux-x64-gpu"
-    \\provider="cpu"
-    \\cudnn_lib="$data/cudnn/lib"
-    \\if [ ! -f "$cudnn_lib/libcudnn.so.9" ] && [ -x "$data/cuda-env/bin/python" ]; then
-    \\  cudnn_lib="$("$data/cuda-env/bin/python" -c 'import nvidia.cudnn, os; print(os.path.join(os.path.dirname(nvidia.cudnn.__file__), "lib"))' 2>/dev/null || true)"
-    \\fi
-    \\if [ -f "$cudnn_lib/libcudnn.so.9" ] && nvidia-smi >/dev/null 2>&1; then
-    \\  runtime_name="$gpu_runtime"; provider="cuda"
-    \\else
-    \\  runtime_name="$cpu_runtime"
-    \\fi
-    \\runtime="$data/runtime/$runtime_name"
-    \\runtime_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.5/$runtime_name.tar.bz2"
-    \\cuda_lib=""
-    \\if [ -d /usr/local/cuda/targets/x86_64-linux/lib ]; then cuda_lib=":/usr/local/cuda/targets/x86_64-linux/lib"; fi
-    \\model_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
-    \\punctuation_name="sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
-    \\punctuation_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/$punctuation_name.tar.bz2"
-    \\mkdir -p "$data/models" "$data/cache" "$data/transcripts" "$data/runtime"
-    \\upstream_name() {
-    \\  case "$1" in
-    \\    zipformer) echo "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20" ;;
-    \\    paraformer) echo "sherpa-onnx-streaming-paraformer-bilingual-zh-en" ;;
-    \\    zipformer-ctc) echo "sherpa-onnx-streaming-zipformer-ctc-zh-xlarge-int8-2025-06-30" ;;
-    \\    nemo) echo "sherpa-onnx-nemo-ctc-en-conformer-small" ;;
-    \\    japanese) echo "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17" ;;
-    \\    korean) echo "sherpa-onnx-streaming-zipformer-korean-2024-06-16" ;;
-    \\    vietnamese) echo "sherpa-onnx-zipformer-vi-2025-04-20" ;;
-    \\    multilingual) echo "sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10" ;;
-    \\    *) return 1 ;;
-    \\  esac
-    \\}
-    \\install_runtime() {
-    \\  if [ -x "$runtime/bin/sherpa-onnx" ]; then return; fi
-    \\  archive="$data/cache/$runtime_name.tar.bz2"
-    \\  curl -L --fail --retry 3 -C - -o "$archive" "$runtime_url"
-    \\  tar -xjf "$archive" -C "$data/runtime"
-    \\}
-    \\install_model() {
-    \\  model="$(upstream_name "$1")"
-    \\  if [ -f "$data/models/$model/tokens.txt" ]; then echo "Model already installed: $model"; return; fi
-    \\  archive="$data/cache/$model.tar.bz2"
-    \\  curl -L --fail --retry 3 -C - -o "$archive" "$model_url/$model.tar.bz2"
-    \\  tar -xjf "$archive" -C "$data/models"
-    \\  test -f "$data/models/$model/tokens.txt"
-    \\}
-    \\install_punctuation() {
-    \\  punctuation_dir="$data/models/$punctuation_name"
-    \\  if [ -f "$punctuation_dir/model.int8.onnx" ]; then return; fi
-    \\  archive="$data/cache/$punctuation_name.tar.bz2"
-    \\  curl -L --fail --retry 3 -C - -o "$archive" "$punctuation_url"
-    \\  tar -xjf "$archive" -C "$data/models"
-    \\  test -f "$punctuation_dir/model.int8.onnx"
-    \\}
-    \\case "$action" in
-    \\  install)
-    \\    install_runtime
-    \\    install_model "$1"
-    \\    echo "Installed: $1 ($(upstream_name "$1"))"
-    \\    ;;
-    \\  list)
-    \\    default="$(cat "$data/default-model" 2>/dev/null || true)"
-    \\    case "$default" in
-    \\      sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20) default=zipformer ;;
-    \\      sherpa-onnx-streaming-paraformer-bilingual-zh-en) default=paraformer ;;
-    \\      sherpa-onnx-streaming-zipformer-ctc-zh-xlarge-int8-2025-06-30) default=zipformer-ctc ;;
-    \\      sherpa-onnx-nemo-ctc-en-conformer-small) default=nemo ;;
-    \\      sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17) default=japanese ;;
-    \\      sherpa-onnx-streaming-zipformer-korean-2024-06-16) default=korean ;;
-    \\      sherpa-onnx-zipformer-vi-2025-04-20) default=vietnamese ;;
-    \\      sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10) default=multilingual ;;
-    \\    esac
-    \\    for model in zipformer paraformer zipformer-ctc nemo japanese korean vietnamese multilingual; do
-    \\      upstream="$(upstream_name "$model")"; status="installable"; marker=""
-    \\      if [ -f "$data/models/$upstream/tokens.txt" ]; then status="installed"; fi
-    \\      if [ "$model" = "$default" ]; then marker="default"; fi
-    \\      printf '  %-15s %-11s %-7s %s\n' "$model" "$status" "$marker" "$upstream"
-    \\    done
-    \\    ;;
-    \\  doctor)
-    \\    echo "GPU acceleration probe"
-    \\    if nvidia-smi --query-gpu=name,driver_version --format=csv,noheader >/dev/null 2>&1; then
-    \\      nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
-    \\      if [ -f "$cudnn_lib/libcudnn.so.9" ] && ldconfig -p | grep -q 'libcublasLt.so.13'; then
-    \\        echo "CUDA 13 and cuDNN 9 runtime libraries detected; lszl will select provider=cuda."
-    \\      else
-    \\        echo "CUDA device detected, but lszl's managed cuDNN 9 runtime is missing; GPU inference cannot start yet."
-    \\      fi
-    \\    else
-    \\      echo "CUDA unavailable (nvidia-smi cannot contact a driver)."
-    \\    fi
-    \\    if rocm-smi --showproductname >/dev/null 2>&1; then
-    \\      echo "ROCm device detected, but the upstream Linux release used by lszl is CPU/CUDA only."
-    \\    else
-    \\      echo "ROCm unavailable."
-    \\    fi
-    \\    ;;
-    \\  transcribe)
-    \\    model="$1"; input="$2"; upstream="$(upstream_name "$model")"
-    \\    install_runtime; install_punctuation
-    \\    test -f "$data/models/$upstream/tokens.txt" || { echo "Model is not installed: $model. Run: lszl model install $model" >&2; echo "  Portable bundles: unpack the matching lszl-*-models-$model.tar.gz next to lszl-portable/ (or run: lszl model install $model)" >&2; exit 2; }
-    \\    command -v ffmpeg >/dev/null || { echo "ffmpeg is required" >&2; exit 2; }
-    \\    command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
-    \\    work="$data/cache/run-$$"; mkdir -p "$work"
-    \\    cleanup() { status=$?; if [ "$status" -eq 0 ]; then rm -rf "$work"; else echo "Work files retained after failure: $work" >&2; fi; }
-    \\    trap cleanup EXIT
-    \\    model_dir="$data/models/$upstream"; raw="$work/raw.txt"; diagnostics="$work/backend.log"
-    \\    : >"$raw"; : >"$diagnostics"
-    \\    # Pick the encoder/decoder/joiner onnx for a zipformer transducer,
-    \\    # preferring int8 and falling back to the fp32 file.
-    \\    pick_onnx() { # prefix dir
-    \\      f="$(find "$2" -maxdepth 1 -name "$1"*.int8.onnx | head -1)"
-    \\      if [ -z "$f" ]; then f="$(find "$2" -maxdepth 1 -name "$1"*.onnx | head -1)"; fi
-    \\      printf '%s' "$f"
-    \\    }
-    \\    case "$model" in
-    \\      nemo)
-    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le -f segment -segment_time 60 "$work/chunk-%04d.wav" >/dev/null 2>&1
-    \\        for wav in "$work"/chunk-*.wav; do
-    \\          result="$work/result.json"
-    \\          LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx-offline" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --nemo-ctc-model="$model_dir/model.int8.onnx" "$wav" >"$result" 2>>"$diagnostics"
-    \\          jq -r '.text' "$result" >>"$raw"
-    \\        done
-    \\        ;;
-    \\      japanese|vietnamese)
-    \\        enc="$(pick_onnx encoder "$model_dir")"; dec="$(pick_onnx decoder "$model_dir")"; joi="$(pick_onnx joiner "$model_dir")"
-    \\        test -n "$enc" -a -n "$dec" -a -n "$joi" || { echo "transducer model files missing in $model_dir" >&2; exit 3; }
-    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le -f segment -segment_time 60 "$work/chunk-%04d.wav" >/dev/null 2>&1
-    \\        for wav in "$work"/chunk-*.wav; do
-    \\          result="$work/result.json"
-    \\          LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx-offline" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --encoder="$enc" --decoder="$dec" --joiner="$joi" "$wav" >"$result" 2>>"$diagnostics"
-    \\          jq -r '.text' "$result" >>"$raw"
-    \\        done
-    \\        ;;
-    \\      zipformer|korean|multilingual)
-    \\        wav="$work/input.wav"; result="$work/result.txt"
-    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le "$wav" >/dev/null 2>&1
-    \\        enc="$(pick_onnx encoder "$model_dir")"; dec="$(pick_onnx decoder "$model_dir")"; joi="$(pick_onnx joiner "$model_dir")"
-    \\        test -n "$enc" -a -n "$dec" -a -n "$joi" || { echo "transducer model files missing in $model_dir" >&2; exit 3; }
-    \\        LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --encoder="$enc" --decoder="$dec" --joiner="$joi" "$wav" >"$result" 2>>"$diagnostics"
-    \\        awk '/^\{ "text": / { print previous; exit } { previous=$0 }' "$diagnostics" >"$raw"
-    \\        ;;
-    \\      paraformer)
-    \\        wav="$work/input.wav"; result="$work/result.txt"
-    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le "$wav" >/dev/null 2>&1
-    \\        LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --paraformer-encoder="$model_dir/encoder.int8.onnx" --paraformer-decoder="$model_dir/decoder.int8.onnx" "$wav" >"$result" 2>>"$diagnostics"
-    \\        awk '/^\{ "text": / { print previous; exit } { previous=$0 }' "$diagnostics" >"$raw"
-    \\        ;;
-    \\      zipformer-ctc)
-    \\        wav="$work/input.wav"; result="$work/result.txt"
-    \\        ffmpeg -nostdin -y -i "$input" -ac 1 -ar 16000 -c:a pcm_s16le "$wav" >/dev/null 2>&1
-    \\        LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx" --provider="$provider" --num-threads=1 --tokens="$model_dir/tokens.txt" --zipformer2-ctc-model="$model_dir/model.int8.onnx" "$wav" >"$result" 2>>"$diagnostics"
-    \\        awk '/^\{ "text": / { print previous; exit } { previous=$0 }' "$diagnostics" >"$raw"
-    \\        ;;
-    \\    esac
-    \\    test -s "$raw" || { echo "Recognizer returned no transcript text" >&2; exit 3; }
-    \\    stem="$(basename "$input")"; output="$data/transcripts/$model/$stem.txt"; mkdir -p "$(dirname "$output")"
-    \\    temporary="$output.tmp-$$"; : >"$temporary"
-    \\    punctuation_model="$data/models/$punctuation_name/model.int8.onnx"
-    \\    while IFS= read -r text; do
-    \\      [ -z "$text" ] && continue
-    \\      LD_LIBRARY_PATH="$runtime/lib:$cudnn_lib$cuda_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$runtime/bin/sherpa-onnx-offline-punctuation" --provider="$provider" --num-threads=1 --ct-transformer="$punctuation_model" "$text" >>"$temporary" 2>>"$diagnostics"
-    \\    done <"$raw"
-    \\    mv "$temporary" "$output"; cp "$diagnostics" "$output.log"
-    \\    echo "Model: $model ($provider)"
-    \\    echo "Transcript: $output"
-    \\    echo "Diagnostics: $output.log"
-    \\    ;;
-    \\esac
-;
-
-fn runRuntime(init: std.process.Init, action: []const u8, model: ?[]const u8, input: ?[]const u8, stdout: *std.Io.Writer) !void {
-    const data = try dataDirectory(init.gpa);
-    defer init.gpa.free(data);
-    var args = std.ArrayList([]const u8).empty;
-    defer args.deinit(init.gpa);
-    try args.append(init.gpa, "bash");
-    try args.append(init.gpa, "-ceu");
-    try args.append(init.gpa, runtime_script);
-    try args.append(init.gpa, "lszl-runtime");
-    try args.append(init.gpa, action);
-    try args.append(init.gpa, data);
-    if (model) |value| try args.append(init.gpa, value);
-    if (input) |value| try args.append(init.gpa, value);
-    const result = try std.process.run(init.gpa, init.io, .{ .argv = args.items, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(64 * 1024) });
-    defer init.gpa.free(result.stdout);
-    defer init.gpa.free(result.stderr);
-    try stdout.writeAll(result.stdout);
-    try stdout.writeAll(result.stderr);
-    try stdout.flush();
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.RuntimeFailed,
-        else => return error.RuntimeFailed,
-    }
-}
-
-fn printModelList(writer: *std.Io.Writer) !void {
-    try writer.writeAll("Models (name, status, upstream archive):\n");
-}
-
-fn autoExecutionProvider() []const u8 {
-    // The first native sherpa integration will probe CUDA/ROCm provider
-    // libraries from the selected prebuilt bundle. CPU is always safe.
-    if (std.c.getenv("CUDA_VISIBLE_DEVICES") != null) return "cuda";
-    if (std.c.getenv("ROCR_VISIBLE_DEVICES") != null) return "rocm";
-    return "cpu";
-}
-
-fn modelNameIsValid(name: []const u8) bool {
-    return name.len != 0 and std.mem.indexOfAny(u8, name, "/\\\n\r") == null;
-}
-
-/// Returns the directory for data owned by lszl itself, such as installed
-/// models and the selected default. User-provided audio is never copied here.
-///
-/// The portable distribution sets LSZL_DATA_HOME to the bundle's `data/`
-/// directory (used as-is, not a base), so the whole bundle — runtime, models,
-/// transcripts — stays self-contained and no system packages are required.
-fn dataDirectory(allocator: std.mem.Allocator) ![]u8 {
-    if (std.c.getenv("LSZL_DATA_HOME")) |value| return allocator.dupe(u8, std.mem.span(value));
-    const base = if (std.c.getenv("XDG_DATA_HOME")) |value|
-        std.mem.span(value)
-    else if (std.c.getenv("HOME")) |value|
-        try std.fmt.allocPrint(allocator, "{s}/.local/share", .{std.mem.span(value)})
-    else
-        return error.HomeNotFound;
-    defer if (std.c.getenv("XDG_DATA_HOME") == null) allocator.free(base);
-    return std.fmt.allocPrint(allocator, "{s}/lszl", .{base});
-}
-
-fn saveDefaultModel(io: std.Io, allocator: std.mem.Allocator, name: []const u8) !void {
-    if (!modelNameIsValid(name)) return error.InvalidModelName;
-    const directory = try dataDirectory(allocator);
-    defer allocator.free(directory);
-    try std.Io.Dir.createDirPath(.cwd(), io, directory);
-    const path = try std.fmt.allocPrint(allocator, "{s}/default-model", .{directory});
-    defer allocator.free(path);
-    try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = name });
-}
-
-fn loadDefaultModel(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
-    const directory = try dataDirectory(allocator);
-    defer allocator.free(directory);
-    const path = try std.fmt.allocPrint(allocator, "{s}/default-model", .{directory});
-    defer allocator.free(path);
-    const content = try std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(4096));
-    defer allocator.free(content);
-    // Tolerate files written by hand or with echo/printf (trailing newline).
-    return allocator.dupe(u8, std.mem.trim(u8, content, " \t\r\n"));
-}
-
 pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
     const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     const command = parseArgs(raw_args[1..]) catch |err| {
         std.debug.print("lszl: {s}\n", .{@errorName(err)});
         try printUsage(stdout);
         try stdout.flush();
-        return;
+        std.process.exit(exit_usage);
     };
 
-    switch (command) {
-        .help => try printUsage(stdout),
-        .doctor => try runRuntime(init, "doctor", null, null, stdout),
-        .model_list => {
-            try printModelList(stdout);
-            try stdout.flush();
-            try runRuntime(init, "list", null, null, stdout);
+    const code: u8 = switch (command) {
+        .help => blk: {
+            try printUsage(stdout);
+            break :blk exit_ok;
         },
-        .model_default => |name| {
-            if (name) |model_name| {
-                const selected = presetName(model_name) orelse return error.UnsupportedModel;
-                try saveDefaultModel(init.io, init.gpa, selected);
-                try stdout.print("Default model set to {s}.\n", .{selected});
-            } else {
-                const default_name = loadDefaultModel(init.io, init.gpa) catch |err| {
-                    if (err == error.FileNotFound) {
-                        try stdout.writeAll("No default model configured.\n");
-                        try stdout.flush();
-                        return;
-                    }
-                    return err;
-                };
-                defer init.gpa.free(default_name);
-                try stdout.print("Default model: {s}\n", .{presetName(default_name) orelse default_name});
+        .doctor => try runDoctor(allocator, io, stdout),
+        .model_list => try runModelList(allocator, io, stdout),
+        .model_default => |name| try runModelDefault(allocator, io, stdout, name),
+        .model_install => |name| try runModelInstall(allocator, io, init.environ_map, stdout, name),
+        .transcribe => |request| try runTranscribe(allocator, io, init.environ_map, stdout, request),
+    };
+    try stdout.flush();
+    std.process.exit(code);
+}
+
+// --- exit codes ---------------------------------------------------------------
+
+const exit_ok: u8 = 0;
+const exit_usage: u8 = 2;
+const exit_model: u8 = 3;
+const exit_media: u8 = 4;
+const exit_inference: u8 = 5;
+const exit_runtime: u8 = 6;
+const exit_fetch: u8 = 7;
+
+// --- transcribe ----------------------------------------------------------------
+
+fn runTranscribe(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+    stdout: *std.Io.Writer,
+    request: Command.Transcribe,
+) !u8 {
+    const data_dir = model_store.dataDirectory(allocator) catch |err| {
+        if (err == error.HomeNotFound) std.debug.print("lszl: cannot determine the data directory (set HOME or XDG_DATA_HOME)\n", .{});
+        return exit_runtime;
+    };
+    defer allocator.free(data_dir);
+    const layout = model_store.Layout{ .data_dir = data_dir };
+
+    // Resolve the model by name, or by the configured default.
+    const configured: []const u8 = if (request.model_name) |name|
+        name
+    else blk: {
+        const loaded = model_store.loadDefaultModel(allocator, io, data_dir) catch |err| {
+            if (err == error.FileNotFound) {
+                try stdout.writeAll("No default model configured.\n");
+                try stdout.flush();
+                std.debug.print("lszl: set one with: lszl model default <name>\n", .{});
+                return exit_model;
             }
+            return exit_model;
+        };
+        break :blk loaded;
+    };
+    defer if (request.model_name == null) allocator.free(configured);
+
+    const model = preset.find(configured) orelse {
+        std.debug.print("lszl: unsupported model name: {s}\n", .{configured});
+        return exit_model;
+    };
+    if (!model_store.isInstalled(io, allocator, layout, model)) {
+        std.debug.print("lszl: model is not installed: {s}. Run: lszl model install {s}\n", .{ model.name, model.name });
+        return exit_model;
+    }
+
+    var report = transcribe.run(.{
+        .io = io,
+        .allocator = allocator,
+        .environ_map = environ_map,
+        .layout = layout,
+        .model = model,
+        .input = request.input,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return exit_inference,
+        error.MediaFailed => {
+            std.debug.print("lszl: failed to decode {s}\n", .{request.input});
+            return exit_media;
         },
-        .model_install => |name| {
-            if (presetName(name)) |selected| {
-                try runRuntime(init, "install", selected, null, stdout);
-            } else {
-                try stdout.print("Unsupported model name: {s}\n", .{name});
-            }
+        error.InferenceFailed, error.PunctuationFailed => return exit_inference,
+        error.RuntimeUnavailable => return exit_runtime,
+        error.WriteFailed => return exit_media,
+        error.ModelNotInstalled => return exit_model,
+    };
+    defer report.deinit(allocator);
+
+    if (report.device_name) |device| {
+        try stdout.print("Model: {s} ({s}, {s})\n", .{ model.name, report.provider.label(), device });
+    } else {
+        try stdout.print("Model: {s} ({s})\n", .{ model.name, report.provider.label() });
+    }
+    try stdout.print("Transcript: {s}\n", .{report.transcript_path});
+    try stdout.print("Diagnostics: {s}\n", .{report.log_path});
+    try stdout.print("Audio {d:.1}s in {d:.1}s ({d:.2}x realtime), {d} segments\n", .{
+        report.audio_seconds,
+        report.elapsed_seconds,
+        if (report.elapsed_seconds > 0) report.audio_seconds / report.elapsed_seconds else 0,
+        report.segments,
+    });
+    return exit_ok;
+}
+
+// --- model management ------------------------------------------------------------
+
+fn runModelInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *std.process.Environ.Map,
+    stdout: *std.Io.Writer,
+    name: []const u8,
+) !u8 {
+    const model = preset.find(name) orelse {
+        std.debug.print("lszl: unsupported model name: {s}\n", .{name});
+        return exit_model;
+    };
+    const data_dir = model_store.dataDirectory(allocator) catch return exit_runtime;
+    defer allocator.free(data_dir);
+    const layout = model_store.Layout{ .data_dir = data_dir };
+
+    _ = model_store.installModel(allocator, io, environ_map, layout, model) catch |err| switch (err) {
+        error.AlreadyInstalled => {
+            try stdout.print("Model already installed: {s}\n", .{model.name});
+            return exit_ok;
         },
-        .transcribe => |request| {
-            const configured = request.model_name orelse try loadDefaultModel(init.io, init.gpa);
-            defer if (request.model_name == null) init.gpa.free(configured);
-            const selected = presetName(configured) orelse return error.UnsupportedModel;
-            try runRuntime(init, "transcribe", selected, request.input, stdout);
+        error.OutOfMemory => return exit_fetch,
+        error.VerifyFailed => {
+            std.debug.print("lszl: downloaded archive failed SHA-256 verification\n", .{});
+            return exit_fetch;
         },
+        error.FetchFailed => {
+            std.debug.print("lszl: download failed\n", .{});
+            return exit_fetch;
+        },
+        else => {
+            std.debug.print("lszl: installation failed ({s})\n", .{@errorName(err)});
+            return exit_fetch;
+        },
+    };
+    try stdout.print("Installed: {s} ({s})\n", .{ model.name, model.upstream_name });
+    return exit_ok;
+}
+
+fn runModelDefault(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    name: ?[]const u8,
+) !u8 {
+    const data_dir = model_store.dataDirectory(allocator) catch return exit_runtime;
+    defer allocator.free(data_dir);
+
+    if (name) |requested| {
+        const model = preset.find(requested) orelse {
+            std.debug.print("lszl: unsupported model name: {s}\n", .{requested});
+            return exit_model;
+        };
+        model_store.saveDefaultModel(allocator, io, data_dir, model.name) catch return exit_runtime;
+        try stdout.print("Default model set to {s}.\n", .{model.name});
+        return exit_ok;
+    }
+
+    const current = model_store.loadDefaultModel(allocator, io, data_dir) catch |err| {
+        if (err == error.FileNotFound) {
+            try stdout.writeAll("No default model configured.\n");
+            return exit_ok;
+        }
+        return exit_runtime;
+    };
+    defer allocator.free(current);
+    const shown = if (preset.find(current)) |model| model.name else current;
+    try stdout.print("Default model: {s}\n", .{shown});
+    return exit_ok;
+}
+
+fn runModelList(allocator: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !u8 {
+    const data_dir = model_store.dataDirectory(allocator) catch return exit_runtime;
+    defer allocator.free(data_dir);
+    const layout = model_store.Layout{ .data_dir = data_dir };
+
+    const default_name = model_store.loadDefaultModel(allocator, io, data_dir) catch null;
+    defer if (default_name) |name| allocator.free(name);
+
+    try stdout.writeAll("Models (name, status, upstream archive):\n");
+    for (&preset.presets) |*model| {
+        const status: []const u8 = if (model_store.isInstalled(io, allocator, layout, model)) "installed" else "installable";
+        const marker: []const u8 = if (default_name) |current|
+            (if (std.mem.eql(u8, current, model.name)) "default" else "")
+        else
+            "";
+        try stdout.print("  {s:<15} {s:<11} {s:<7} {s}\n", .{ model.name, status, marker, model.upstream_name });
     }
     try stdout.flush();
+    return exit_ok;
 }
+
+// --- doctor ----------------------------------------------------------------------
+
+const RuntimePresence = enum { present, absent, partial };
+
+fn runDoctor(allocator: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer) !u8 {
+    const data_dir = model_store.dataDirectory(allocator) catch return exit_runtime;
+    defer allocator.free(data_dir);
+    const layout = model_store.Layout{ .data_dir = data_dir };
+
+    try stdout.writeAll("GPU acceleration probe\n");
+    var any_cuda = false;
+    if (gpu.probe(allocator)) |probed| {
+        if (probed) |probed_device| {
+            any_cuda = true;
+            var device = probed_device;
+            try stdout.print("  {s}: {d} MiB total, {d} MiB free\n", .{
+                device.name,
+                device.total_bytes / (1024 * 1024),
+                device.free_bytes / (1024 * 1024),
+            });
+            device.deinit(allocator);
+        } else {
+            try stdout.writeAll("  no NVIDIA device is reachable (driver/NVML missing)\n");
+        }
+    } else |_| {
+        try stdout.writeAll("  no NVIDIA device is reachable (driver/NVML missing)\n");
+    }
+
+    if (any_cuda) {
+        const cudnn_dir = layout.cudnnLibDir(allocator) catch return exit_runtime;
+        defer allocator.free(cudnn_dir);
+        if (hasFileIn(io, cudnn_dir, "libcudnn.so.9")) {
+            try stdout.print("  cuDNN 9 runtime found at {s}; lszl will select provider=cuda.\n", .{cudnn_dir});
+        } else {
+            try stdout.print("  CUDA device detected, but the managed cuDNN 9 runtime is missing at {s}.\n  Install it with: just install-cudnn\n", .{cudnn_dir});
+        }
+        if (systemCudaLibsPresent(io)) {
+            try stdout.writeAll("  CUDA 13 runtime libraries (cublas/cudart) detected on the system.\n");
+        } else {
+            try stdout.writeAll("  CUDA 13 runtime libraries not found on the system; GPU inference cannot start.\n");
+        }
+        switch (runtimePresence(allocator, io, layout, model_store.runtime_gpu.name)) {
+            .present => try stdout.writeAll("  sherpa-onnx CUDA runtime: installed.\n"),
+            .partial => try stdout.writeAll("  sherpa-onnx CUDA runtime: incomplete; it is re-fetched automatically on first use.\n"),
+            .absent => try stdout.writeAll("  sherpa-onnx CUDA runtime: not installed yet; it is downloaded automatically on first use.\n"),
+        }
+    } else {
+        try stdout.writeAll("  lszl will use the CPU execution provider.\n");
+    }
+
+    if (rocmSmiPresent(io)) {
+        try stdout.writeAll("ROCm device detected, but the pinned sherpa-onnx runtime is CPU/CUDA only.\n");
+    }
+
+    switch (runtimePresence(allocator, io, layout, model_store.runtime_cpu.name)) {
+        .present => try stdout.writeAll("sherpa-onnx CPU runtime: installed.\n"),
+        .partial => try stdout.writeAll("sherpa-onnx CPU runtime: incomplete; it is re-fetched automatically on first use.\n"),
+        .absent => try stdout.writeAll("sherpa-onnx CPU runtime: not installed yet; it is downloaded automatically on first use.\n"),
+    }
+    try stdout.flush();
+    return exit_ok;
+}
+
+fn runtimePresence(allocator: std.mem.Allocator, io: std.Io, layout: model_store.Layout, runtime_name: []const u8) RuntimePresence {
+    const runtime_dir = layout.runtimeDir(allocator) catch return .absent;
+    defer allocator.free(runtime_dir);
+    const lib_dir = std.fs.path.join(allocator, &.{ runtime_dir, runtime_name, "lib" }) catch return .absent;
+    defer allocator.free(lib_dir);
+    const c_api = hasFileIn(io, lib_dir, "libsherpa-onnx-c-api.so");
+    const ort = hasFileIn(io, lib_dir, "libonnxruntime.so");
+    if (c_api and ort) return .present;
+    if (c_api or ort) return .partial;
+    return .absent;
+}
+
+fn hasFileIn(io: std.Io, dir: []const u8, name: []const u8) bool {
+    const path = std.fs.path.join(std.heap.page_allocator, &.{ dir, name }) catch return false;
+    defer std.heap.page_allocator.free(path);
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
+}
+
+fn systemCudaLibsPresent(io: std.Io) bool {
+    const candidates = [_][]const u8{
+        "/usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.13",
+        "/usr/local/cuda/lib64/libcublasLt.so.13",
+        "/usr/lib64/libcublasLt.so.13",
+        "/usr/lib/x86_64-linux-gnu/libcublasLt.so.13",
+    };
+    for (candidates) |path| {
+        if (std.Io.Dir.accessAbsolute(io, path, .{})) {
+            return true;
+        } else |_| {}
+    }
+    return false;
+}
+
+fn rocmSmiPresent(io: std.Io) bool {
+    const path_env = std.c.getenv("PATH") orelse return false;
+    var it = std.mem.splitScalar(u8, std.mem.span(path_env), ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = std.fs.path.join(std.heap.page_allocator, &.{ dir, "rocm-smi" }) catch continue;
+        defer std.heap.page_allocator.free(candidate);
+        std.Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
+        return true;
+    }
+    return false;
+}
+
+// --- tests -------------------------------------------------------------------------
 
 test "model default can query without a model name" {
     const command = try parseArgs(&.{ "model", "default" });
@@ -435,21 +428,17 @@ test "transcribe addresses models by name" {
 }
 
 test "preset names are short and legacy upstream names migrate" {
-    try std.testing.expectEqualStrings("paraformer", presetName("paraformer").?);
-    try std.testing.expectEqualStrings("paraformer", presetName("sherpa-onnx-streaming-paraformer-bilingual-zh-en").?);
-    try std.testing.expect(presetName("unknown") == null);
+    try std.testing.expectEqualStrings("paraformer", preset.find("paraformer").?.name);
+    try std.testing.expectEqualStrings("paraformer", preset.find("sherpa-onnx-streaming-paraformer-bilingual-zh-en").?.name);
+    try std.testing.expect(preset.find("unknown") == null);
 }
 
-test "catalog excludes non archives and files over one gibibyte" {
-    try std.testing.expect(Catalog.isSupportedArchive("sherpa-onnx-whisper-small.tar.bz2", Catalog.max_archive_bytes));
-    try std.testing.expect(!Catalog.isSupportedArchive("model.onnx", 1));
-    try std.testing.expect(!Catalog.isSupportedArchive("sherpa-onnx-too-large.tar.bz2", Catalog.max_archive_bytes + 1));
-}
-
-test "native API headers are available" {
-    // Portable builds deliberately skip the system FFmpeg/sherpa-onnx
-    // linkage, so the native headers are not present at compile time.
-    if (build_options.portable) return error.SkipZigTest;
-    _ = c.ffmpeg.AV_NOPTS_VALUE;
-    _ = c.sherpa.SherpaOnnxGetVersionStr;
+test "all pipeline modules are wired into the test build" {
+    _ = @import("ffmpeg.zig");
+    _ = @import("sherpa.zig");
+    _ = @import("archive.zig");
+    _ = @import("fetch.zig");
+    _ = @import("gpu.zig");
+    _ = @import("model_store.zig");
+    _ = @import("transcribe.zig");
 }

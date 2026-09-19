@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Pack a self-contained, relocatable lszl distribution.
 #
-# The result is a tarball that any Linux x86_64 user can unpack and run
-# without installing any system packages (no zig, no ffmpeg, no jq, no
-# sherpa-onnx, no cuDNN). It bundles:
-#   - the static lszl executable, static FFmpeg 7.1.5 and static jq 1.7.1
-#   - the sherpa-onnx CPU runtime, trimmed to the three binaries lszl uses
+# The native lszl binary decodes media through the FFmpeg shared libraries
+# and drives sherpa-onnx through its C API (dlopen at run time), so the
+# bundle contains no CLI subprocesses at all:
+#   - the lszl executable (dynamic) + shared FFmpeg libav* libraries
+#   - the sherpa-onnx CPU runtime (libraries only, trimmed)
 #   - the punctuation model
 #   - GPU support: the CUDA sherpa-onnx runtime and cuDNN 9 (auto-selected
 #     when an NVIDIA driver with CUDA 13 libraries is present)
@@ -28,7 +28,7 @@
 #   scripts/portable-pack.sh --no-models-pack                # app bundle only
 set -euo pipefail
 
-version="0.1.1"
+version="0.2.0"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache="$repo_root/.portable-cache"
 staging="$repo_root/.portable-staging"
@@ -69,16 +69,22 @@ cudnn_archive="cudnn-linux-x86_64-9.25.0.15_cuda13-archive"
 cudnn_url="https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/${cudnn_archive}.tar.xz"
 cudnn_sha256="bdf8c65f92dd552141d011fd7e7a1bfbafdc6239667b15c44d604597fa927745"
 
-# Static FFmpeg 7.1.5 build from BtbN/FFmpeg-Builds (tag pins the exact build).
-ffmpeg_release="autobuild-2026-08-15-13-02"
-ffmpeg_archive="ffmpeg-n7.1.5-16-g9a4bb2c579-linux64-gpl-7.1.tar.xz"
-ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/${ffmpeg_release}/${ffmpeg_archive}"
-ffmpeg_sha256="198fafe897ad9d84bc776d895047ec2c0d21346977a53895b771fec9b01643fa"
+# Shared FFmpeg build from BtbN/FFmpeg-Builds (libav* .so libraries; the
+# binary is built against this exact tree via -Dffmpeg_prefix). BtbN prunes
+# old autobuild tags, so by default the newest release is resolved at pack
+# time and the resolved URL + SHA-256 are recorded in dist/FFMPEG-SOURCE.txt.
+# Export FFMPEG_URL (and FFMPEG_SHA256) to pin an exact artifact instead.
+ffmpeg_url="${FFMPEG_URL:-}"
+ffmpeg_sha256="${FFMPEG_SHA256:-}"
+if [ -z "$ffmpeg_url" ]; then
+  echo "==> resolving newest BtbN shared FFmpeg build"
+  ffmpeg_url="$(curl -sL --fail "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest" \
+    | grep -o '"browser_download_url": *"[^"]*linux64-gpl-shared[^"]*\.tar\.xz"' \
+    | head -1 | cut -d'"' -f4)"
+  test -n "$ffmpeg_url" || { echo "cannot resolve a BtbN shared FFmpeg build" >&2; exit 2; }
+fi
 
-# Statically linked jq 1.7.1.
-jq_archive="jq-linux-amd64"
-jq_url="https://github.com/jqlang/jq/releases/download/jq-1.7.1/${jq_archive}"
-jq_sha256="5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5"
+# jq is no longer needed: the native pipeline replaced every jq call.
 
 # Punctuation model, needed by every transcribe.
 punctuation_name="sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
@@ -105,6 +111,7 @@ model_upstream_vietnamese="sherpa-onnx-zipformer-vi-2025-04-20"
 model_upstream_multilingual="sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10"
 
 # --- Helpers -----------------------------------------------------------------
+mkdir -p "$cache"
 fetch() { # url dest sha256
   if [ -e "$2" ] && printf '%s  %s\n' "$3" "$2" | sha256sum -c --quiet 2>/dev/null; then
     echo "cached: $2"; return
@@ -120,19 +127,29 @@ fetch() { # url dest sha256
 install_runtime() { # archive_dir top_name
   dir="$bundle_dir/data/runtime/$2"
   tar -xjf "$cache/$1" -C "$bundle_dir/data/runtime"
-  for bin in "$dir"/bin/*; do
-    case "$(basename "$bin")" in
-      sherpa-onnx|sherpa-onnx-offline|sherpa-onnx-offline-punctuation) ;;
-      *) rm -f "$bin" ;;
-    esac
-  done
-  rm -f "$dir"/bin/sherpa-onnx-version
-  test -x "$dir/bin/sherpa-onnx"
-  test -x "$dir/bin/sherpa-onnx-offline"
-  test -x "$dir/bin/sherpa-onnx-offline-punctuation"
-  # Keep the whole lib/ directory: the trimmed binaries link against these.
+  # lszl drives sherpa-onnx through the C API (dlopen); no CLI needed.
+  rm -rf "$dir/bin"
+  test -f "$dir/lib/libsherpa-onnx-c-api.so"
   test -f "$dir/lib/libonnxruntime.so"
 }
+
+# --- Fetch the shared FFmpeg tree ---------------------------------------------
+echo "==> fetching shared FFmpeg: $ffmpeg_url"
+if [ -n "$ffmpeg_sha256" ]; then
+  fetch "$ffmpeg_url" "$cache/ffmpeg-shared.tar.xz" "$ffmpeg_sha256"
+else
+  if [ -e "$cache/ffmpeg-shared.tar.xz" ]; then echo "cached (unpinned): $cache/ffmpeg-shared.tar.xz";
+  else
+    curl -L --fail --retry 3 -C - -o "$cache/ffmpeg-shared.tar.xz.part" "$ffmpeg_url"
+    mv "$cache/ffmpeg-shared.tar.xz.part" "$cache/ffmpeg-shared.tar.xz"
+  fi
+  ffmpeg_sha256="$(sha256sum "$cache/ffmpeg-shared.tar.xz" | cut -d' ' -f1)"
+fi
+mkdir -p "$staging/ffmpeg"
+tar -xJf "$cache/ffmpeg-shared.tar.xz" -C "$staging/ffmpeg" --strip-components=1
+test -f "$staging/ffmpeg/lib/libavformat.so"
+mkdir -p "$dist_dir"
+printf 'url: %s\nsha256: %s\n' "$ffmpeg_url" "$ffmpeg_sha256" > "$dist_dir/FFMPEG-SOURCE.txt"
 
 # --- Build the portable binary -----------------------------------------------
 echo "==> building portable lszl binary"
@@ -142,9 +159,8 @@ mkdir -p "$cache/zig-global" "$cache/zig-local" 2>/dev/null || true
 zig_global_cache="${ZIG_GLOBAL_CACHE_DIR:-$cache/zig-global}"
 zig_local_cache="${ZIG_LOCAL_CACHE_DIR:-$cache/zig-local}"
 ZIG_GLOBAL_CACHE_DIR="$zig_global_cache" ZIG_LOCAL_CACHE_DIR="$zig_local_cache" \
-  zig build -Dportable -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --prefix "$staging/zig-out"
+  zig build -Doptimize=ReleaseSafe -Dffmpeg_prefix="$staging/ffmpeg" --prefix "$staging/zig-out"
 test -x "$staging/zig-out/bin/lszl"
-"$staging/zig-out/bin/lszl" help >/dev/null
 
 # --- Assemble the bundle -------------------------------------------------------
 rm -rf "$bundle_dir"
@@ -173,18 +189,13 @@ if [ "$bundle_gpu" = "1" ]; then
   test -f "$bundle_dir/data/cudnn/lib/libcudnn.so.9"
 fi
 
-echo "==> bundling static ffmpeg and jq"
-fetch "$ffmpeg_url" "$cache/ffmpeg.tar.xz" "$ffmpeg_sha256"
-mkdir -p "$staging/ffmpeg"
-tar -xJf "$cache/ffmpeg.tar.xz" -C "$staging/ffmpeg"
-ffmpeg_dir="$(find "$staging/ffmpeg" -maxdepth 1 -type d -name 'ffmpeg-*' | head -1)"
-install -m755 "$ffmpeg_dir/bin/ffmpeg" "$bundle_dir/bin/ffmpeg"
-install -m755 "$ffmpeg_dir/bin/ffprobe" "$bundle_dir/bin/ffprobe"
-"$bundle_dir/bin/ffmpeg" -version >/dev/null
-
-fetch "$jq_url" "$cache/jq" "$jq_sha256"
-install -m755 "$cache/jq" "$bundle_dir/bin/jq"
-"$bundle_dir/bin/jq" --version >/dev/null
+echo "==> bundling shared FFmpeg libraries"
+mkdir -p "$bundle_dir/lib"
+for so in "$staging/ffmpeg"/lib/libavformat.so* "$staging/ffmpeg"/lib/libavcodec.so* \
+          "$staging/ffmpeg"/lib/libavutil.so* "$staging/ffmpeg"/lib/libswresample.so*; do
+  cp -a "$so" "$bundle_dir/lib/"
+done
+test -e "$bundle_dir/lib/libavformat.so"
 
 # Extract one ASR model archive into a data/models directory.
 # Usage: bundle_model <model> <dest_data_models_dir>
@@ -239,7 +250,7 @@ cat > "$bundle_dir/lszl" <<'LAUNCHER'
 self="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
 here="$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)"
 export LSZL_DATA_HOME="$here/data"
-export PATH="$here/bin:$PATH"
+export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$here/bin/lszl" "$@"
 LAUNCHER
 chmod +x "$bundle_dir/lszl"
@@ -324,7 +335,7 @@ EOF
 
 # --- Smoke test ---------------------------------------------------------------
 echo "==> smoke test"
-(cd "$bundle_dir" && ./lszl help >/dev/null && ./lszl model list >/dev/null)
+(cd "$bundle_dir" && ./lszl help >/dev/null && ./lszl model list >/dev/null && ./lszl doctor >/dev/null)
 
 # --- Archive -------------------------------------------------------------------
 mkdir -p "$dist_dir"
@@ -346,11 +357,18 @@ if [ "$models_pack_list" != "none" ]; then
 fi
 
 tar -czf "$archive" -C "$staging" "$bundle_name"
-(cd "$dist_dir" && sha256sum "lszl-${version}-linux-x86_64-portable.tar.gz" "lszl-${version}-linux-x86_64-models-"*.tar.gz > SHA256SUMS)
+cd "$dist_dir"
+{
+  sha256sum "lszl-${version}-linux-x86_64-portable.tar.gz"
+  # Model packs are optional (--no-models-pack); glob may be empty.
+  sha256sum lszl-${version}-linux-x86_64-models-*.tar.gz 2>/dev/null || true
+} > SHA256SUMS
 echo "==> produced:"
 echo "  $archive"
 for pack in "$dist_dir"/lszl-${version}-linux-x86_64-models-*.tar.gz; do
   [ -e "$pack" ] && echo "  $pack"
 done
 echo "  $dist_dir/SHA256SUMS"
-du -h "$archive" "$dist_dir"/lszl-${version}-linux-x86_64-models-*.tar.gz
+echo "  $dist_dir/FFMPEG-SOURCE.txt"
+du -h "$archive"
+du -h lszl-${version}-linux-x86_64-models-*.tar.gz 2>/dev/null || true

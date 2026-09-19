@@ -23,22 +23,18 @@ bundle, so unpacking it next to the app bundle merges that model's
 the app bundle as well (the model packs then carry the same list), or
 `--no-models-pack` to skip the model packs.
 
-## Why the native build is not portable
+## Why the bundle ships shared libraries
 
-`build.zig` links the executable against system FFmpeg (`libavformat`,
-`libavcodec`, `libavutil`, `libswresample` via `pkg-config`) and against the
-pinned sherpa-onnx C API distribution. A machine without those libraries
-cannot even start the binary, and installing them is exactly the friction the
-portable bundle removes.
-
-The current CLI delegates all real work to bundled command-line tools through
-an embedded shell script (`runtime_script` in `src/main.zig`), so the native
-linkage is unused at runtime today. `-Dportable` therefore builds the binary
-with **no** system library linkage: `zig build -Dportable
--Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe` produces a fully static
-musl executable that runs on any Linux x86_64 distribution. The build-time
-header test (`src/main.zig`, gated on `build_options.portable`) is skipped in
-this mode.
+Since the native port, lszl decodes media through the FFmpeg shared
+libraries and drives sherpa-onnx through its C API (dlopen at run time).
+The bundle therefore ships the shared `libav*`/`libswresample` libraries and
+the trimmed sherpa-onnx runtime bundles; the launcher exports
+`LD_LIBRARY_PATH` so the dynamic lszl binary resolves them from the bundle.
+There is no `-Dportable`/musl-static mode anymore: the pack builds with
+`zig build -Doptimize=ReleaseSafe -Dffmpeg_prefix=<shared ffmpeg tree>`,
+which links the binary against the pinned shared FFmpeg build that is
+bundled alongside it. Host requirements shrink to glibc + NVIDIA driver
+(optional); no ffmpeg/jq/sherpa-onnx packages.
 
 ## Runtime data relocation
 
@@ -60,13 +56,16 @@ user's home directory.
 
 ```text
 lszl-portable/
-├── lszl                  # launcher: sets LSZL_DATA_HOME + PATH, execs bin/lszl
+├── lszl                  # launcher: sets LSZL_DATA_HOME + LD_LIBRARY_PATH + PATH
 ├── README.txt            # end-user quick start
+├── install.sh            # per-user install into ~/.local (idempotent, --uninstall)
 ├── bin/
-│   ├── lszl              # static musl executable (portable build)
-│   ├── ffmpeg            # static FFmpeg 7.1.5 (BtbN/FFmpeg-Builds)
-│   ├── ffprobe           # same static build
-│   └── jq                # static jq 1.7.1
+│   └── lszl              # dynamic executable (built against the bundled libav*)
+├── lib/
+│   ├── libavformat.so.*  # shared FFmpeg 7.1.5 (BtbN/FFmpeg-Builds, gpl-shared)
+│   ├── libavcodec.so.*   #   resolved at pack time; see FFMPEG-SOURCE.txt
+│   ├── libavutil.so.*
+│   └── libswresample.so.*
 └── data/
     ├── default-model                     # pre-set to paraformer
     ├── runtime/
@@ -82,16 +81,11 @@ lszl-portable/
 ### Trimming
 
 The upstream sherpa-onnx runtimes ship ~35 binaries each (microphone, ALSA,
-VAD, keyword spotter, diarization, websocket servers, …). lszl only invokes
-three, so the packer deletes everything else:
-
-- `sherpa-onnx` — streaming ASR (zipformer, paraformer, zipformer-ctc)
-- `sherpa-onnx-offline` — offline ASR (nemo)
-- `sherpa-onnx-offline-punctuation` — punctuation
-
-The whole `lib/` directory is kept (the trimmed binaries link against
-`libonnxruntime.so` and the sherpa C++ API). The punctuation model directory
-is trimmed to `model.int8.onnx`.
+VAD, keyword spotter, diarization, websocket servers, …). The native lszl
+calls none of them — it dlopens the C API — so the packer deletes the whole
+`bin/` directory and keeps only `lib/` (`libsherpa-onnx-c-api.so` plus
+`libonnxruntime.so` and providers). The punctuation model directory is
+trimmed to `model.int8.onnx`.
 
 ### GPU support
 
@@ -115,16 +109,17 @@ bundle. Downloads are cached in `.portable-cache/` and verified with
 | sherpa-onnx CPU runtime | `v1.13.5` release tag | `a3936961…fac84166` |
 | sherpa-onnx CUDA runtime | `v1.13.5` release tag | `dde7732e…2ca7a35` |
 | cuDNN 9 (CUDA 13) | NVIDIA redist `9.25.0.15_cuda13` | `bdf8c65f…fa927745` |
-| FFmpeg static build | BtbN release `autobuild-2026-08-15-13-02`, asset `ffmpeg-n7.1.5-16-g9a4bb2c579-linux64-gpl-7.1.tar.xz` | `198fafe8…b01643fa` |
-| jq | `jq-1.7.1` release asset `jq-linux-amd64` | `5942c9b0…d19c8ff5` |
+| FFmpeg shared build | BtbN latest at pack time, or `FFMPEG_URL`+`FFMPEG_SHA256` | recorded in `dist/FFMPEG-SOURCE.txt` |
 | punctuation model | `punctuation-models` release tag | `c0d5aa5f…328a6e1` |
 | ASR models (8 presets) | `asr-models` release tag | pinned per model in the script |
 
 Notes:
 
-- FFmpeg comes from BtbN/FFmpeg-Builds rather than johnvansickle.com because
-  the latter blocks scripted access (HTTP 403); the BtbN release tag pins the
-  exact git revision of the build.
+- BtbN prunes old autobuild tags, so the previously pinned
+  `autobuild-2026-08-15-13-02` artifact no longer downloads. The pack script
+  resolves the newest `linux64-gpl-shared` build at pack time and records the
+  resolved URL + SHA-256 in `dist/FFMPEG-SOURCE.txt`; export `FFMPEG_URL` and
+  `FFMPEG_SHA256` to restore full pin-before-fetch reproducibility.
 - ASR model archives are large (paraformer ~1 GB, zipformer-ctc ~0.6 GB), so
   they ship as one tarball per model by default. `--models` embeds them in
   the app bundle; `--no-gpu` and `--no-models-pack` shrink the app bundle.
@@ -141,15 +136,19 @@ scripts/portable-pack.sh --no-models-pack                    # app bundle only
 
 The script:
 
-1. builds the portable static binary into a staging prefix,
-2. fetches and SHA-256-verifies every pinned artifact into `.portable-cache/`,
-3. assembles `lszl-portable/` under `.portable-staging/`, trimming each
-   sherpa-onnx runtime to the three binaries lszl uses,
-4. pre-sets `data/default-model` to `paraformer`,
-5. smoke-tests `./lszl help` and `./lszl model list` from the bundle,
-6. writes `dist/lszl-<version>-linux-x86_64-portable.tar.gz`, one
+1. resolves (or takes `FFMPEG_URL`), fetches and SHA-256-verifies the shared
+   FFmpeg tree into `.portable-cache/`,
+2. builds the portable dynamic binary against it (`-Dffmpeg_prefix`),
+3. fetches and SHA-256-verifies every remaining pinned artifact into
+   `.portable-cache/`,
+4. assembles `lszl-portable/` under `.portable-staging/`, trimming each
+   sherpa-onnx runtime to `lib/` only (the native lszl calls no CLI),
+5. pre-sets `data/default-model` to `paraformer`,
+6. smoke-tests `./lszl help`, `./lszl model list` and `./lszl doctor` from
+   the bundle,
+7. writes `dist/lszl-<version>-linux-x86_64-portable.tar.gz`, one
    `dist/lszl-<version>-linux-x86_64-models-<name>.tar.gz` per model
-   (unless `--no-models-pack`), and `SHA256SUMS`.
+   (unless `--no-models-pack`), plus `SHA256SUMS` and `FFMPEG-SOURCE.txt`.
 
 Note: ASR model archives are large (paraformer ~1 GB, zipformer-ctc ~0.6 GB),
 so they are kept out of the app bundle by default and shipped as one tarball
@@ -161,8 +160,8 @@ of a several-GB all-in-one archive or `lszl model install` over the network.
 ### Portable mode (no fixed location)
 
 ```shell
-tar -xzf lszl-0.1.1-linux-x86_64-portable.tar.gz
-tar -xzf lszl-0.1.1-linux-x86_64-models-paraformer.tar.gz   # same directory: merges data/models/
+tar -xzf lszl-0.2.0-linux-x86_64-portable.tar.gz
+tar -xzf lszl-0.2.0-linux-x86_64-models-paraformer.tar.gz   # same directory: merges data/models/
 cd lszl-portable
 ./lszl transcribe "录音.m4a"          # default model paraformer, fully offline
 ./lszl transcribe --model nemo "speech.wav"
@@ -179,8 +178,8 @@ layout with a thin launcher in `bin` and the program plus all data under
 `share`:
 
 ```shell
-tar -xzf lszl-0.1.1-linux-x86_64-portable.tar.gz
-tar -xzf lszl-0.1.1-linux-x86_64-models-paraformer.tar.gz   # same directory
+tar -xzf lszl-0.2.0-linux-x86_64-portable.tar.gz
+tar -xzf lszl-0.2.0-linux-x86_64-models-paraformer.tar.gz   # same directory
 cd lszl-portable
 ./install.sh
 # -> $HOME/.local/bin/lszl          thin launcher, on PATH by default
@@ -197,5 +196,6 @@ Notes:
 
 Host dependencies that remain: `bash`, `curl`, `tar`, `sha256sum` and the
 glibc needed by the bundled sherpa-onnx runtime — all present on any
-mainstream Linux distribution. The `lszl` executable itself and `jq` are
-statically linked; FFmpeg is a static build that only needs glibc.
+mainstream Linux distribution. FFmpeg and jq are no longer required on the
+host at all: the libav* shared libraries ship inside the bundle, and every
+former `ffmpeg`/`jq` call now runs natively inside lszl.
